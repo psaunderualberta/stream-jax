@@ -1,7 +1,7 @@
 import equinox as eqx
-from jax import numpy as jnp, random as jax_random, tree as jt, jit, lax as jax_lax
+from jax import numpy as jnp, random as jax_random, tree as jt, jit, lax as jax_lax, value_and_grad
 import chex
-from util import ReLU, Linear, is_none, update_eligibility_trace, ObGD, init_eligibility_trace, normalize_observation, scale_reward
+from util import LeakyReLU, Linear, is_none, update_eligibility_trace, ObGD, init_eligibility_trace, normalize_observation, scale_reward, linear_epsilon_schedule
 from gymnax.environments import environment, spaces
 from gymnax import make
 from typing import Any
@@ -18,86 +18,69 @@ class QNetwork(eqx.Module):
             hidden_layer_sizes: list[int],
             num_actions: int,
             key: chex.PRNGKey,
-            activation: eqx.Module = ReLU()
+            activation: eqx.Module = LeakyReLU()
         ):
         self.layers = []
         self.activation = activation
         in_size = obs_shape
         for size in hidden_layer_sizes:
             # Add a linear layer
-            layer = Linear(in_size, size, key=key)
+            key, _key = jax_random.split(key)
+            layer = Linear(in_size, size, key=_key)
             self.layers.append(layer)
+
             # Add layer norm
             layer_norm = eqx.nn.LayerNorm(size, use_weight=False, use_bias=False)
             self.layers.append(layer_norm)
+
             # Add activation function
             self.layers.append(activation)
             in_size = size
 
         # Final output layer
-        output_layer = Linear(in_size, num_actions, key=key)
+        key, _key = jax_random.split(key)
+        output_layer = Linear(in_size, num_actions, key=_key)
         self.layers.append(output_layer)
-        print(self.layers)
-    
-    @classmethod
-    def from_architecture(arch: "QNetwork", key: chex.PRNGKey):
-        """Create a new QNetwork with the same architecture as *arch* but with new parameters."""
-        input_size = arch.layers[0].in_features
-        hidden_layer_sizes = []
-        for layer in arch.layers[:-1]:  # Exclude the last layer (output layer)
-            hidden_layer_sizes.append(layer.out_features)
-        
-        num_actions = arch.num_actions()
-        return QNetwork(input_size, hidden_layer_sizes, num_actions, key, activation=arch.activation)
-        
-    @eqx.filter_jit
-    def __call__(self, state):
-        x = state
+
+    @jit
+    def __call__(self, x):
         for layer in self.layers:
             x = layer(x)
         return x
     
     def num_actions(self):
-        return self.layers[-1].weight.shape[1]
-
-    @eqx.filter_jit
-    def get_action(self, state):
-        return jnp.argmax(self(state), axis=-1)
+        return self.layers[-1].weight.shape[0]
 
 
-@eqx.filter_jit
-def get_td_error_grad(q_network, reward, gamma, done, s, a, sp):
-    qsp = jax_lax.stop_gradient(jnp.max(q_network(sp), axis=-1))
-    qsa = q_network(s)[a]
+@jit
+def get_td_error(q_network, reward, gamma, done, s, a, sp):
+    q_sp = q_network(sp).max()
+    q_sa = q_network(s)[a]
     return (
         reward
-        + gamma * jax_lax.select(done, jnp.zeros_like(qsp), qsp)
-        - qsa
+        + jax_lax.stop_gradient(gamma * q_sp * done)
+        - q_sa
     )
 
 
-@eqx.filter_jit
-def _q_state_value(q_network, x):
-    """Compute the state value from the Q-values."""
-    q_values = q_network(x)
-    return jnp.max(q_values, axis=-1)
-
-@eqx.filter_jit
+@jit
 def q_epsilon_greedy(q_network, state, epsilon: float, key: chex.PRNGKey):
     """Select an action using epsilon-greedy policy."""
     key, eps_key, action_key = jax_random.split(key, 3)
 
     q_values = q_network(state)
     explore = jax_random.uniform(eps_key) < epsilon
+    greedy_action = jnp.argmax(q_values, axis=-1)
     action = jax_lax.select(
         explore,
         jax_random.randint(action_key, (1,), 0, q_network.num_actions()).squeeze(),
-        jnp.argmax(q_values, axis=-1)
+        greedy_action
     )
 
     q_value = q_values[action]
 
-    return action, q_value, explore
+    explored = jax_lax.select(action == greedy_action, False, explore)
+    return action, q_value, explored
 
 
 def stream_q(
@@ -108,7 +91,9 @@ def stream_q(
     lambda_: float,
     alpha: float,
     kappa: float,
-    epsilon_greedy: float,
+    start_e: float,
+    end_e: float,
+    exploration_fraction: float,
     total_timesteps: int,
     key: chex.PRNGKey,
 ):
@@ -129,7 +114,7 @@ def stream_q(
         u: float
 
     current_timestep = 0
-    state_value_grad_fun = eqx.filter_grad(_q_state_value)
+
     def while_loop_body(carry: LoopState):
         # extract carry elements
         obs, state = carry.obs, carry.state
@@ -141,45 +126,31 @@ def stream_q(
         key, action_key = jax_random.split(carry.key)
 
         # Select an action using epsilon-greedy policy.
-        action, q_value, explored = q_epsilon_greedy(q_network, obs, epsilon_greedy, action_key)
-
-        # reset eligibility trace if an exploration occurred
-        z_w = jt.map(lambda new, old: jax_lax.select(
-                explored,
-                new,
-                old
-            ),
-            init_eligibility_trace(q_network),
-            z_w
-        )
+        eps = linear_epsilon_schedule(start_e, end_e, exploration_fraction * total_timesteps, t)
+        action, q_value, explored = q_epsilon_greedy(q_network, obs, eps, action_key)
 
         # Step the environment.
         key, step_key = jax_random.split(key)
         next_obs, next_state, reward, done, _ = env.step(step_key, state, action, env_params)
 
+        # reset eligibility trace if an exploration occurred
+        z_w = jt.map(lambda old: jax_lax.select(
+                explored,
+                jnp.zeros_like(old),
+                old
+            ), z_w
+        )
+
+        # normalize observation & reward
         next_obs, mu_s, p_s = normalize_observation(next_obs, mu_s, p_s, t)
         scaled_reward, u, p_r = scale_reward(reward, gamma, u, p_r, done, t)
 
-        # Compute td error
-        next_state_value = _q_state_value(q_network, next_obs)
-        td_error = (
-            scaled_reward
-            + gamma * jax_lax.select(done, jnp.zeros_like(next_state_value), next_state_value)
-            - q_value
-        )
-
         # Update eligibility trace
-        state_value_grad = state_value_grad_fun(q_network, obs)
-        z_w = update_eligibility_trace(z_w, gamma, lambda_, state_value_grad)
+        td_error, td_grad = value_and_grad(get_td_error)(q_network, scaled_reward, gamma, done, obs, action, next_obs)
+        z_w = update_eligibility_trace(z_w, gamma, lambda_, td_grad)
 
         # Update Q-network using ObGD
-        q_network = ObGD(
-            z_w,
-            q_network,
-            td_error,
-            alpha,
-            kappa
-        )
+        q_network = ObGD(z_w, q_network, td_error, alpha, kappa)
 
         return LoopState(
             key=key,
@@ -206,13 +177,28 @@ def stream_q(
         0,
     )
 
+    @eqx.filter_jit
+    def jitted_while_loop(episode_state: LoopState):
+        return jax_lax.while_loop(
+            lambda carry: jnp.logical_not(carry.done),
+            while_loop_body,
+            episode_state
+        )
+
+    def non_jitted_while_loop(episode_state: LoopState):
+        while not episode_state.done:
+            episode_state = while_loop_body(episode_state)
+        
+        return episode_state
+
+
     i = 0
     while current_timestep < total_timesteps:
         # reset environment
         key, reset_key = jax_random.split(key)
         obs, state = env.reset(reset_key, env_params)
         obs, mu_s, p_s = normalize_observation(obs, mu_s, p_s, t)
-        
+
         initial_loop_state = LoopState(
             key=key,
             q_network=q_network,
@@ -229,13 +215,10 @@ def stream_q(
             u=u,
         )
 
-        state = initial_loop_state
+        episode_result = initial_loop_state
 
-        episode_result = jax_lax.while_loop(
-            lambda carry: jnp.logical_not(carry.done),
-            while_loop_body,
-            initial_loop_state
-        )
+        # episode_result = non_jitted_while_loop(episode_result)
+        episode_result = jitted_while_loop(episode_result)
 
         key = episode_result.key
         q_network = episode_result.q_network
@@ -248,7 +231,8 @@ def stream_q(
             episode_result.u
         )
         
-        print(f"Finished Episode {i} with reward: {episode_result.reward_}")
+        epsilon = linear_epsilon_schedule(start_e, end_e, exploration_fraction * total_timesteps, current_timestep)
+        print(f"Ep: {i}: Epsiodic Return: {episode_result.reward_:.1f}. Percent elapsed: {100 * current_timestep / total_timesteps:2.2f}%. Epsilon: {epsilon:.2f}")
         i += 1
     
     return q_network
@@ -260,11 +244,11 @@ if __name__ == "__main__":
     key, key_reset, key_act, key_step = jax_random.split(key, 4)
 
     # Instantiate the environment & its settings.
-    env, env_params = make("MountainCar-v0")
+    env, env_params = make("CartPole-v1")
 
     obs_shape = env.observation_space(env_params).shape[0]
     num_actions = env.action_space(env_params).n
-    hidden_layer_sizes = [8, 8]  # Example hidden layer sizes
+    hidden_layer_sizes = [32, 32]  # Example hidden layer sizes
     q_network = QNetwork(obs_shape, hidden_layer_sizes, num_actions, key_reset)
 
     # Run the stream Q-learning algorithm
@@ -272,13 +256,16 @@ if __name__ == "__main__":
         q_network,
         env,
         env_params,
-        gamma=1.0,
+        gamma=0.99,
         lambda_=0.8,
         alpha=1.0,
         kappa=2.0,
-        epsilon_greedy=0.6,
-        total_timesteps=10_000,
+        start_e=1.0,
+        end_e=0.01,
+        exploration_fraction=0.05,
+        total_timesteps=500_000,
         key=key_act
     )
 
-    visualize(env, env_params, q_network, key)
+    print([x for x in jt.leaves(q_network)])
+
