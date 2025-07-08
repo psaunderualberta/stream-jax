@@ -134,7 +134,7 @@ def init_eligibility_trace(
 
 class LeakyReLU(eqx.Module):
     def __call__(self, x):
-        return jax.nn.leaky_relu(x)
+        return jnp.where(x <= 0, 0.01 * x, x)
 
 
 class Linear(eqx.Module):

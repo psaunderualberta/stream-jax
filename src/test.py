@@ -1,10 +1,15 @@
 import chex
 import equinox as eqx
-from util import LeakyReLU, Linear, LayerNorm
+from util import LeakyReLU, Linear
 import jax.random as jax_random
 import jax.numpy as jnp
 from jax import grad, vmap
 import jax.tree as jt
+import pickle as pkl
+
+
+with open("./data.pkl", "rb") as f:
+    w1, b1, w2, b2, w3, b3 = pkl.load(f)
 
 
 def layer_norm(x):
@@ -12,7 +17,8 @@ def layer_norm(x):
 
 
 class QNetwork(eqx.Module):
-    layers: list[chex.Array]
+    weights: list[chex.Array]
+    biases:  list[chex.Array]
     activation: eqx.Module
 
     def __init__(
@@ -25,28 +31,34 @@ class QNetwork(eqx.Module):
         ):
         self.activation = activation
         k1, k2, k3 = jax_random.split(key, 3)
-        self.layers = [
-            Linear(obs_shape, hidden_layer_sizes, key=k1),
-            Linear(hidden_layer_sizes, hidden_layer_sizes, key=k2),
-            Linear(hidden_layer_sizes, num_actions, key=k3),
+        self.weights = [
+            jnp.array(w1, dtype=jnp.float32),
+            jnp.array(w2, dtype=jnp.float32),
+            jnp.array(w3, dtype=jnp.float32),
+        ]
+
+        self.biases = [
+            jnp.array(b1, dtype=jnp.float32),
+            jnp.array(b2, dtype=jnp.float32),
+            jnp.array(b3, dtype=jnp.float32),
         ]
 
     def __call__(self, x):
-        x = self.layers[0](x)
+        x = self.weights[0] @ x + self.biases[0]
+        x = (x - x.mean()) / jnp.sqrt(x.var() + 1e-5)
+        x = LeakyReLU()(x)
+        x = self.weights[1] @ x + self.biases[1]
         x = eqx.nn.LayerNorm(32, use_weight=False, use_bias=False)(x)
         x = LeakyReLU()(x)
-        x = self.layers[1](x)
-        x = eqx.nn.LayerNorm(32, use_weight=False, use_bias=False)(x)
-        x = LeakyReLU()(x)
-        return self.layers[2](x)
+        return self.weights[2] @ x + self.biases[2]
     
     def num_actions(self):
         return self.layers[-1].weight.shape[0]
 
     
 if __name__ == "__main__":
-    q = QNetwork(4, 32, 3, jax_random.PRNGKey(0))
-    t = jnp.array([0, 0, 0, 0], dtype=jnp.float32)
+    q = QNetwork(4, 32, 2, jax_random.PRNGKey(0))
+    t = jnp.array([1, 1, 1, 1], dtype=jnp.float32)
     r = -q(t)[0]
     grads = grad(lambda q, t: -q(t)[0])(q, t)
     for grad_ in jt.leaves(grads):
