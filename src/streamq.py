@@ -1,11 +1,14 @@
 import equinox as eqx
-from jax import numpy as jnp, random as jax_random, tree as jt, jit, lax as jax_lax, value_and_grad
+from jax import numpy as jnp, random as jax_random, tree as jt, jit, lax as jax_lax, value_and_grad, jax
 import chex
 from util import LeakyReLU, Linear, is_none, update_eligibility_trace, ObGD, init_eligibility_trace, normalize_observation, scale_reward, linear_epsilon_schedule
 from gymnax.environments import environment, spaces
 from gymnax import make
 from typing import Any
 from visualizer import visualize
+
+
+jax.config.update('jax_default_device', jax.devices('cpu')[0])
 
 
 class QNetwork(eqx.Module):
@@ -30,11 +33,11 @@ class QNetwork(eqx.Module):
             self.layers.append(layer)
 
             # Add layer norm
-            layer_norm = eqx.nn.LayerNorm(size, use_weight=False, use_bias=False)
-            self.layers.append(layer_norm)
+            # layer_norm = eqx.nn.LayerNorm(size, use_weight=False, use_bias=False)
+            # self.layers.append(layer_norm)
 
-            # Add activation function
-            self.layers.append(activation)
+            # # Add activation function
+            # self.layers.append(activation)
             in_size = size
 
         # Final output layer
@@ -44,9 +47,11 @@ class QNetwork(eqx.Module):
 
     @jit
     def __call__(self, x):
-        for layer in self.layers:
+        for layer in self.layers[:-1]:
             x = layer(x)
-        return x
+            x = (x - x.mean()) / jnp.sqrt(x.var() + 1e-5)
+            x = self.activation(x)
+        return self.layers[-1](x)
     
     def num_actions(self):
         return self.layers[-1].weight.shape[0]
@@ -73,13 +78,15 @@ def q_epsilon_greedy(q_network, state, epsilon: float, key: chex.PRNGKey):
     greedy_action = jnp.argmax(q_values, axis=-1)
     action = jax_lax.select(
         explore,
-        jax_random.randint(action_key, (1,), 0, q_network.num_actions()).squeeze(),
+        jax_random.randint(
+            action_key, (1,), 0, q_network.num_actions()
+        ).squeeze(),
         greedy_action
     )
 
     q_value = q_values[action]
 
-    explored = jax_lax.select(action == greedy_action, False, explore)
+    explored = action != greedy_action
     return action, q_value, explored
 
 
@@ -240,7 +247,7 @@ def stream_q(
 if __name__ == "__main__":
     # Example usage
     
-    key = jax_random.key(0)
+    key = jax_random.key(1)
     key, key_reset, key_act, key_step = jax_random.split(key, 4)
 
     # Instantiate the environment & its settings.
@@ -262,8 +269,8 @@ if __name__ == "__main__":
         kappa=2.0,
         start_e=1.0,
         end_e=0.01,
-        exploration_fraction=0.05,
-        total_timesteps=500_000,
+        exploration_fraction=0.5,
+        total_timesteps=50_000,
         key=key_act
     )
 

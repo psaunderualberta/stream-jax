@@ -39,8 +39,8 @@ def ObGD(
     def _apply_update(m, e):
         if e is None:
             return m
-        else:
-            return m - alpha_ * delta * e
+        
+        return m - alpha_ * delta * e
 
     return jtu.tree_map(_apply_update, model, eligibility_trace, is_leaf=is_none)
 
@@ -82,7 +82,7 @@ def normalize_observation(
     p: chex.Array,
     n: Union[int, chex.Array],
 ):
-    mu, var, p, n = sample_mean_var(observation, mu, p, n)
+    mu, p, var, n = sample_mean_var(observation, mu, p, n)
     return (observation - mu) / jnp.sqrt(var + __eps), mu, p
 
 
@@ -121,6 +121,7 @@ def update_eligibility_trace(
     return jtu.tree_map(update_trace, z_w, new_term, is_leaf=is_none)
 
 
+@eqx.filter_jit
 def init_eligibility_trace(
     model: eqx.Module
 ):
@@ -130,6 +131,7 @@ def init_eligibility_trace(
         return jnp.zeros_like(model_arr)
 
     return jtu.tree_map(fun, model, is_leaf=is_none)
+    
 
 
 class LeakyReLU(eqx.Module):
@@ -142,7 +144,7 @@ class Linear(eqx.Module):
     bias: chex.Array
 
     def __init__(self, in_size, out_size, key):
-        self.weight, self.bias = sparse_init_linear(in_size, out_size, sparsity_level=0.0, key=key)
+        self.weight, self.bias = sparse_init_linear(in_size, out_size, sparsity_level=0.9, key=key)
 
     def __call__(self, x):
         return self.weight @ x + self.bias
