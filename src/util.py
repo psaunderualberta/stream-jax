@@ -1,5 +1,6 @@
 from jax import numpy as jnp, lax as jax_lax, tree_util as jtu, jit
 from jax import random as jr
+import jax
 import optax
 import equinox as eqx
 
@@ -116,14 +117,13 @@ def update_eligibility_trace(
     def update_trace(z_w_, new_term_):
         if new_term_ is None:
             return z_w_
-        return gamma * lambda_ * z_w_ - new_term_
+        return gamma * lambda_ * z_w_ + new_term_
     return jtu.tree_map(update_trace, z_w, new_term, is_leaf=is_none)
 
 
 def init_eligibility_trace(
     model: eqx.Module
 ):
-
     def fun(model_arr):
         if model_arr is None:
             return model_arr
@@ -134,7 +134,7 @@ def init_eligibility_trace(
 
 class LeakyReLU(eqx.Module):
     def __call__(self, x):
-        return jax_lax.select(x < 0, 0.01 * x, x)
+        return jax.nn.leaky_relu(x)
 
 
 class Linear(eqx.Module):
@@ -142,15 +142,10 @@ class Linear(eqx.Module):
     bias: chex.Array
 
     def __init__(self, in_size, out_size, key):
-        self.weight, self.bias = sparse_init_linear(in_size, out_size, sparsity_level=0.9, key=key)
+        self.weight, self.bias = sparse_init_linear(in_size, out_size, sparsity_level=0.0, key=key)
 
     def __call__(self, x):
         return self.weight @ x + self.bias
-
-
-class LayerNorm(eqx.Module):
-    def __call__(self, x):
-        return (x - x.mean()) / jnp.sqrt(x.var() + 1e-5)
 
 
 def linear_epsilon_schedule(start_e, end_e, duration, t):
