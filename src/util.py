@@ -45,45 +45,70 @@ def ObGD(
     return jtu.tree_map(_apply_update, model, eligibility_trace, is_leaf=is_none)
 
 
-@jit
-def sample_mean_var(
-    x: Union[float, chex.Array],
-    mu: Union[float, chex.Array],
-    p: Union[float, chex.Array],
-    n: Union[int, chex.Array]
-):
-    n += 1
-    mu_bar = mu + (x - mu) / n
-    p = p + (x - mu) * (x - mu_bar)
-    var = jax_lax.select(n >= 2, p / (n - 1), jnp.ones_like(p))
-    return mu_bar, p, var, n
+class SampleMeanStats(eqx.Module):
+    mu: chex.Array
+    p: chex.Array
+    var: chex.Array
+    count: int
+
+    def __init__(self, mu, p, var, count):
+        self.mu = mu
+        self.p = p
+        self.var = var
+        self.count = count
+
+    @classmethod
+    def new_params(cls, shape):
+        mu = jnp.ones(shape, dtype=get_float_dtype())
+        p = jnp.zeros(shape, dtype=get_float_dtype())
+        var = jnp.zeros(shape, dtype=get_float_dtype())
+        count = 1
+
+        return SampleMeanStats(
+            mu=mu,
+            p=p,
+            var=var,
+            count=count,
+        )
 
 
-@jit
-def scale_reward(
-    reward: Union[float, chex.Array],
-    gamma: Union[float, chex.Array],
-    u: Union[float, chex.Array],
-    p: Union[float, chex.Array],
-    done: Union[bool, chex.Array],
-    n: Union[int, chex.Array],
-):
-    done = done.astype(reward.dtype)
-    u = gamma * (1 - done) * u + reward
-    _, p, var, n = sample_mean_var(u, 0, p, n)
-    reward_scaled = reward / jnp.sqrt(var + __eps)
-    return reward_scaled, u, p
+class SampleMeanUpdate(eqx.Module):
+    @classmethod
+    def update(cls, sample: Union[float, chex.Array], stats: SampleMeanStats):
+        new_count = stats.count + 1
+        mu_bar = stats.mu + (sample - stats.mu) / new_count
+        new_p = stats.p + (sample - stats.mu) * (sample - mu_bar)
+        var = jax_lax.select(new_count >= 2, new_p / (new_count - 1), jnp.ones_like(new_p))
+        return SampleMeanStats(
+            mu=mu_bar,
+            p=new_p,
+            var=var,
+            count=new_count
+        )
 
 
 @jit
 def normalize_observation(
     observation: chex.Array,
-    mu: chex.Array,
-    p: chex.Array,
-    n: Union[int, chex.Array],
+    observation_stats: SampleMeanStats
 ):
-    mu, p, var, n = sample_mean_var(observation, mu, p, n)
-    return (observation - mu) / jnp.sqrt(var + __eps), mu, p
+    new_stats = SampleMeanUpdate.update(observation, observation_stats)
+    return (observation - new_stats.mu) / jnp.sqrt(new_stats.var + __eps), new_stats
+
+
+@jit
+def scale_reward(
+    reward: Union[float, chex.Array],
+    reward_stats: SampleMeanStats,
+    reward_trace: Union[float, chex.Array],
+    done: bool,
+    gamma: Union[float, chex.Array],
+):
+    done = done.astype(reward.dtype)
+    reward_trace = gamma * (1 - done) * reward_trace + reward
+    new_stats = SampleMeanUpdate.update(reward_trace, reward_stats)
+    reward_scaled = reward / jnp.sqrt(new_stats.var + __eps)
+    return reward_scaled, reward_trace, new_stats
 
 
 # @eqx.filter_jit
