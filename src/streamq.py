@@ -63,8 +63,8 @@ class QNetwork(eqx.Module):
     def __call__(self, x):
         for layer in self.layers[:-1]:
             x = layer(x)
-            # x = (x - x.mean()) / jnp.sqrt(x.var() + 1e-5)
-            # x = self.activation(x)
+            x = (x - x.mean()) / jnp.sqrt(x.var() + 1e-5)
+            x = self.activation(x)
         return self.layers[-1](x)
     
     def num_actions(self):
@@ -83,7 +83,7 @@ def get_delta(q_network, reward, gamma, done, s, a, sp):
     )
 
 
-# @jit
+@jit
 def q_epsilon_greedy(q_network, state, epsilon: float, key: chex.PRNGKey):
     """Select an action using epsilon-greedy policy."""
     key, eps_key, action_key = jax_random.split(key, 3)
@@ -206,14 +206,13 @@ def stream_q(
     obs_stats = SampleMeanStats.new_params(obs.shape)
     obs, obs_stats = normalize_observation(obs, obs_stats)
     reward_stats = SampleMeanStats.new_params(())
-    z_w = init_eligibility_trace(q_network)
     while current_timestep < total_timesteps:
         initial_loop_state = LoopState(
             key=key,
             done=False,
             obs=obs,
             state=state,
-            z_w=z_w,
+            z_w=init_eligibility_trace(q_network),
             q_network=q_network,
             reward_=0.0,
             reward_trace=0.0,
@@ -239,7 +238,7 @@ def stream_q(
         obs, obs_stats = normalize_observation(obs, obs_stats)
 
         epsilon = linear_epsilon_schedule(start_e, end_e, stop_exploring_timestep, current_timestep)
-        print(f"Ep: {i}. Episodic Return: {episode_result.reward_}. Percent elapsed: {100 * current_timestep / total_timesteps:2.2f}%. Epsilon: {epsilon:.2f}")
+        print(f"Ep: {i}. Episodic Return: {episode_result.reward_:.1f}. Percent elapsed: {100 * current_timestep / total_timesteps:2.2f}%. Epsilon: {epsilon:.2f}")
 
         i += 1
 
@@ -252,11 +251,11 @@ if __name__ == "__main__":
     key, key_reset, key_act, key_step = jax_random.split(key, 4)
 
     # Instantiate the environment & its settings.
-    env, env_params = RightIsGoodEnv(), RightIsGoodParams()
+    env, env_params = make("CartPole-v1")
 
     obs_shape = env.observation_space(env_params).shape[0]
     num_actions = env.action_space(env_params).n
-    hidden_layer_sizes = []  # Example hidden layer sizes
+    hidden_layer_sizes = [32, 32]  # Example hidden layer sizes
     q_network = QNetwork(obs_shape, hidden_layer_sizes, num_actions, key_reset)
 
     # Run the stream Q-learning algorithm
@@ -264,7 +263,7 @@ if __name__ == "__main__":
         q_network,
         env,
         env_params,
-        gamma=0.99,
+        gamma=1.0,
         lambda_=0.8,
         alpha=1.0,
         kappa=2.0,
