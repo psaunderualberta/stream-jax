@@ -29,9 +29,11 @@ def ObGD(
     kappa: Union[float, chex.Array]
 ):
     delta_bar = jnp.maximum(jnp.abs(delta), 1.0)
-    eligibility_trace_norm = sum(
-        jnp.abs(x).sum() for x in jtu.tree_leaves(eligibility_trace)
-    )
+
+    eligibility_trace_norm = 0
+    for leaf in jtu.tree_leaves(eligibility_trace):
+        eligibility_trace_norm += jnp.sum(jnp.abs(leaf))
+
     M = alpha * kappa * delta_bar * eligibility_trace_norm
     alpha_ = jnp.minimum(alpha / M, alpha)
 
@@ -39,10 +41,9 @@ def ObGD(
     def _apply_update(m, e):
         if e is None:
             return m
-        
         return m - alpha_ * delta * e
 
-    return jtu.tree_map(_apply_update, model, eligibility_trace, is_leaf=is_none)
+    return jtu.tree_map(_apply_update, model, eligibility_trace)
 
 
 class SampleMeanStats(eqx.Module):
@@ -59,9 +60,9 @@ class SampleMeanStats(eqx.Module):
 
     @classmethod
     def new_params(cls, shape):
-        mu = jnp.ones(shape, dtype=get_float_dtype())
-        p = jnp.zeros(shape, dtype=get_float_dtype())
-        var = jnp.zeros(shape, dtype=get_float_dtype())
+        mu = jnp.zeros(shape, dtype=get_float_dtype())
+        p = jnp.ones(shape, dtype=get_float_dtype())
+        var = jnp.ones(shape, dtype=get_float_dtype())
         count = 1
 
         return SampleMeanStats(
@@ -104,7 +105,6 @@ def scale_reward(
     done: bool,
     gamma: Union[float, chex.Array],
 ):
-    done = done.astype(reward.dtype)
     reward_trace = gamma * (1 - done) * reward_trace + reward
     new_stats = SampleMeanUpdate.update(reward_trace, reward_stats)
     reward_scaled = reward / jnp.sqrt(new_stats.var + __eps)
@@ -143,7 +143,7 @@ def update_eligibility_trace(
         if new_term_ is None:
             return z_w_
         return gamma * lambda_ * z_w_ + new_term_
-    return jtu.tree_map(update_trace, z_w, new_term, is_leaf=is_none)
+    return jtu.tree_map(update_trace, z_w, new_term)
 
 
 @eqx.filter_jit
@@ -157,7 +157,6 @@ def init_eligibility_trace(
 
     return jtu.tree_map(fun, model, is_leaf=is_none)
     
-
 
 class LeakyReLU(eqx.Module):
     def __call__(self, x):

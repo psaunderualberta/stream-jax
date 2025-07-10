@@ -1,11 +1,12 @@
 import chex
 import equinox as eqx
-from util import LeakyReLU, Linear
+from util import LeakyReLU, Linear, ObGD, init_eligibility_trace, update_eligibility_trace
 import jax.random as jax_random
 import jax.numpy as jnp
-from jax import grad, vmap
+from jax import jit, value_and_grad
 import jax.tree as jt
 import pickle as pkl
+from streamq import get_delta
 
 
 with open("./data.pkl", "rb") as f:
@@ -29,21 +30,22 @@ class QNetwork(eqx.Module):
             activation: eqx.Module = LeakyReLU()
         ):
         self.activation = activation
-        k1, k2, k3 = jax_random.split(key, 3)
+        with open("data.pkl", "rb") as f:
+            mats = pkl.load(f)
+        
         self.layers = [
-            Linear(obs_shape, hidden_layer_sizes, k1),
-            eqx.nn.LayerNorm(hidden_layer_sizes, use_weight=False, use_bias=False),
-            LeakyReLU(),
-            Linear(hidden_layer_sizes, hidden_layer_sizes, k2),
-            eqx.nn.LayerNorm(hidden_layer_sizes, use_weight=False, use_bias=False),
-            LeakyReLU(),
-            Linear(hidden_layer_sizes, num_actions, k3)
+            Linear(mats[0], mats[1]),
+            Linear(mats[2], mats[3]),
+            Linear(mats[4], mats[5]),
         ]
 
+    @jit
     def __call__(self, x):
-        for layer in self.layers:
+        for layer in self.layers[:-1]:
             x = layer(x)
-        return x
+            x = (x - x.mean()) / jnp.sqrt(x.var() + 1e-5)
+            x = self.activation(x)
+        return self.layers[-1](x)
     
     def num_actions(self):
         return self.layers[-1].weight.shape[0]
@@ -51,8 +53,27 @@ class QNetwork(eqx.Module):
     
 if __name__ == "__main__":
     q = QNetwork(4, 32, 2, jax_random.PRNGKey(1))
-    t = jnp.array([1, 1, 1, 1], dtype=jnp.float32)
-    r = -q(t)[0]
-    grads = eqx.filter_grad(lambda q, t: -q(t)[0])(q, t)
-    for grad_ in jt.leaves(grads):
+    s = jnp.array([0, 0, 0, 0], dtype=jnp.float32)
+    a = jnp.array(1, dtype=jnp.int32)
+    reward = jnp.array(1, dtype=jnp.float32)
+    sp = jnp.array([-0.6759,  0.7071, -0.6997, -0.7071], dtype=jnp.float32)
+
+    td, grads = value_and_grad(get_delta)(
+        q,
+        reward,
+        0.99,
+        False,
+        s,
+        a,
+        sp
+    )
+
+    print(td)
+
+    z_w = init_eligibility_trace(q)
+    z_w = update_eligibility_trace(z_w, 0.99, 0.8, grads)
+
+    q = ObGD(z_w, q, td, 1.0, 2.0)
+
+    for grad_ in jt.leaves(q):
         print(grad_)
