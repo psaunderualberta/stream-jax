@@ -74,10 +74,11 @@ class QNetwork(eqx.Module):
 @jit
 def get_delta(q_network, reward, gamma, done, s, a, sp):
     q_sp = q_network(sp).max()
+    next_state_value = jax_lax.select(done, jnp.zeros_like(q_sp), q_sp)
     q_sa = q_network(s)[a]
     return (
         reward
-        + jax_lax.stop_gradient(gamma * q_sp * (1 - done))
+        + jax_lax.stop_gradient(gamma * next_state_value)
         - q_sa
     )
 
