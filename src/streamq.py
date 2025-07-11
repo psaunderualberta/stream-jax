@@ -253,7 +253,7 @@ if __name__ == "__main__":
 
     obs_shape = env.observation_space(env_params).shape[0]
     num_actions = env.action_space(env_params).n
-    hidden_layer_sizes = [64, 64]  # Example hidden layer sizes
+    hidden_layer_sizes = [32, 32]  # Example hidden layer sizes
     q_network = QNetwork(obs_shape, hidden_layer_sizes, num_actions, key_reset)
 
     # Run the stream Q-learning algorithm
@@ -266,10 +266,9 @@ if __name__ == "__main__":
         alpha=1.0,
         kappa=2.0,
         start_e=1.0,
-        end_e=0.01,
+        end_e=0.2,
         stop_exploring_timestep=2_000_000,
         total_timesteps=4_000_000,
         key=key_act
     )
-
 
