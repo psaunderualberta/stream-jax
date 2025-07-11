@@ -47,11 +47,11 @@ class QNetwork(eqx.Module):
             self.layers.append(layer)
 
             # # Add layer norm
-            # layer_norm = eqx.nn.LayerNorm(size, use_weight=False, use_bias=False)
-            # self.layers.append(layer_norm)
+            layer_norm = eqx.nn.LayerNorm(size, use_weight=False, use_bias=False)
+            self.layers.append(layer_norm)
 
             # # Add activation function
-            # self.layers.append(activation)
+            self.layers.append(activation)
             in_size = size
 
         # Final output layer
@@ -61,11 +61,9 @@ class QNetwork(eqx.Module):
 
     @jit
     def __call__(self, x):
-        for layer in self.layers[:-1]:
+        for layer in self.layers:
             x = layer(x)
-            x = (x - x.mean()) / jnp.sqrt(x.var() + 1e-5)
-            x = self.activation(x)
-        return self.layers[-1](x)
+        return x
     
     def num_actions(self):
         return self.layers[-1].weight.shape[0]
@@ -74,11 +72,10 @@ class QNetwork(eqx.Module):
 @jit
 def get_delta(q_network, reward, gamma, done, s, a, sp):
     q_sp = q_network(sp).max()
-    next_state_value = jax_lax.select(done, jnp.zeros_like(q_sp), q_sp)
     q_sa = q_network(s)[a]
     return (
         reward
-        + jax_lax.stop_gradient(gamma * next_state_value)
+        + (1 - done) * jax_lax.stop_gradient(gamma * q_sp)
         - q_sa
     )
 
@@ -251,7 +248,8 @@ if __name__ == "__main__":
     key, key_reset, key_act, key_step = jax_random.split(key, 4)
 
     # Instantiate the environment & its settings.
-    env, env_params = make("CartPole-v1")
+    env, env_params = make("MountainCar-v0")
+    env_params = env_params.replace(max_steps_in_episode=10_000)
 
     obs_shape = env.observation_space(env_params).shape[0]
     num_actions = env.action_space(env_params).n
@@ -263,16 +261,15 @@ if __name__ == "__main__":
         q_network,
         env,
         env_params,
-        gamma=1.0,
+        gamma=0.99,
         lambda_=0.8,
         alpha=1.0,
         kappa=2.0,
         start_e=1.0,
         end_e=0.01,
-        stop_exploring_timestep=250_000,
-        total_timesteps=500_000,
+        stop_exploring_timestep=2_000_000,
+        total_timesteps=4_000_000,
         key=key_act
     )
 
-    print([x for x in jt.leaves(q_network)])
 
