@@ -251,11 +251,11 @@ if __name__ == "__main__":
     key, key_reset, key_act, key_step = jax_random.split(key, 4)
 
     # Instantiate the environment & its settings.
-    env, env_params = make("CartPole-v1")
+    env, env_params = make("MountainCar-v0")
 
     obs_shape = env.observation_space(env_params).shape[0]
     num_actions = env.action_space(env_params).n
-    hidden_layer_sizes = [32, 32]  # Example hidden layer sizes
+    hidden_layer_sizes = [64, 64]  # Example hidden layer sizes
     q_network = QNetwork(obs_shape, hidden_layer_sizes, num_actions, key_reset)
 
     # Run the stream Q-learning algorithm
@@ -263,16 +263,16 @@ if __name__ == "__main__":
         q_network,
         env,
         env_params,
-        gamma=1.0,
+        gamma=0.99,
         lambda_=0.8,
         alpha=1.0,
         kappa=2.0,
         start_e=1.0,
         end_e=0.01,
-        stop_exploring_timestep=250_000,
-        total_timesteps=500_000,
+        stop_exploring_timestep=2_000_000,
+        total_timesteps=4_000_000,
         key=key_act
     )
 
-    print([x for x in jt.leaves(q_network)])
+    # print([x for x in jt.leaves(q_network)])
 
