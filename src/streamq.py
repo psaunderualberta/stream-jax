@@ -12,12 +12,11 @@ from util import (
     linear_epsilon_schedule,
     SampleMeanStats,
 )
-from gymnax.environments import environment, spaces
+from gymnax.environments import environment
 from gymnax import make
 from typing import Any
-from visualizer import visualize
-from simple_env import RightIsGoodState, RightIsGoodParams, RightIsGoodEnv
-
+from flax import struct
+from streamx import StreamXAlgorithm, StreamXTrainState
 
 jax.config.update('jax_default_device', jax.devices('cpu')[0])
 
@@ -69,16 +68,145 @@ class QNetwork(eqx.Module):
         return self.layers[-1].weight.shape[0]
 
 
-@jit
-def get_delta(q_network, reward, gamma, done, s, a, sp):
-    q_sp = q_network(sp).max()
-    q_sa = q_network(s)[a]
-    return (
-        reward
-        + (1 - done) * jax_lax.stop_gradient(gamma * q_sp)
-        - q_sa
-    )
+@struct.dataclass
+class StreamQState(StreamXTrainState):
+    ### stream-q specific non-default arguments
+    net: QNetwork = struct.field(pytree_node=True)
 
+    ### stream-q specific default arguments
+    obs: chex.Array = struct.field(pytree_node=False, default=None)
+    state: environment.EnvState = struct.field(pytree_node=False, default=None)
+    next_obs: chex.Array = struct.field(pytree_node=False, default=None)
+    next_state: environment.EnvState = struct.field(pytree_node=False, default=None)
+    action: int = struct.field(pytree_node=False, default=0)
+    explored: bool = struct.field(pytree_node=False, default=False)
+    reward: float = struct.field(pytree_node=False, default=0.0)
+    done: bool = struct.field(pytree_node=False, default=False)
+
+    # eps-greedy
+    start_eps: float = struct.field(pytree_node=False, default=1.0)
+    end_eps: float = struct.field(pytree_node=False, default=0.01)
+    stop_exploring_timestep: float = struct.field(pytree_node=False, default=0.05)
+    delta: float = struct.field(pytree_node=False, default=0)
+    td_grad: QNetwork = struct.field(pytree_node=False, default=None)
+    zw: QNetwork = struct.field(pytree_node=True, default=None)
+
+    ### Default arguments common 
+    current_timestep: int = struct.field(pytree_node=True, default=0)
+    current_episode_num: int = struct.field(pytree_node=True, default=0)
+    reward_stats: SampleMeanStats = struct.field(pytree_node=False, default=SampleMeanStats.new_params(()))
+    obs_stats: SampleMeanStats = struct.field(pytree_node=False, default=SampleMeanStats.new_params(()))
+    reward_trace: float = struct.field(pytree_node=False, default=0.0)
+    eval_callback: callable = struct.field(pytree_node=False, default=None)
+    episode_length: int = struct.field(pytree_node=False, default=0)
+
+    learning_mode: bool = struct.field(pytree_node=False, default=False)
+    key: chex.PRNGKey = struct.field(pytree_node=False, default=jax_random.PRNGKey(0))
+
+
+
+class StreamQ(StreamXAlgorithm):
+    def pre_episode_initialization(self, ts: StreamQState, obs: chex.Array, state: environment.EnvState):
+        return ts.replace(
+            zw = init_eligibility_trace(ts.net),
+            done=False,
+            reward_trace=0.0,
+            episode_length=0,
+        )
+
+    def get_action(self, ts: StreamQState):
+        key, eps_key, action_key = jax_random.split(ts.key, 3)
+        ts = ts.replace(key=key)
+
+        q_values = q_network(ts.state)
+        greedy_action = jnp.argmax(q_values, axis=-1)
+
+        eps = linear_epsilon_schedule(ts.start_eps, ts.end_eps, ts.stop_exploring_timestep, ts.current_timestep)
+        explore = jnp.logical_and(
+            jnp.logical_not(ts.learning_mode),  # not in learning mode i.e. 
+            jax_random.uniform(eps_key) < eps,  # TODO: eplison calculator
+        )
+        action = jax_lax.select(
+            explore,
+            jax_random.randint(action_key, (), 0, q_network.num_actions()),
+            greedy_action
+        )
+
+        q_value = q_values[action]
+        explored = action != greedy_action
+        return action, q_value, explored
+    
+    def update_env_step_outputs(
+            self,
+            ts: StreamQState,
+            next_obs: chex.Array,
+            next_state: environment.EnvState,
+            reward: float,
+            done: bool,
+            info: dict[Any, Any]
+        ):
+        return ts.replace(
+            next_obs=next_obs,
+            next_state=next_state,
+            reward=reward,
+            done=done,
+        )
+    
+    def normalize_observation(self, ts: StreamQState):
+        obs, obs_stats = normalize_observation(ts.obs, ts.obs_stats)
+        return ts.replace(
+            obs=obs,
+            obs_stats=obs_stats,
+        )
+
+    def scale_reward(self, ts: StreamQState):
+        reward, reward_stats = scale_reward(ts.reward, ts.reward_stats)
+        return ts.replace(
+            reward=reward,
+            reward_stats=reward_stats
+        )
+
+    def get_delta_and_traces(self, ts: StreamQState, gamma: float):
+        q_sp = ts.net(ts.next_obs).max()
+        def get_delta(q, s):
+            q_sa = q(s)[ts.action]
+            return (
+                ts.reward
+                + (1 - ts.done) * jax_lax.stop_gradient(gamma * q_sp)
+                - q_sa
+            )
+
+        td_error, td_grad = value_and_grad(get_delta)(ts.net, ts.obs)
+        return ts.replace(
+            delta=td_error,
+            td_grad=td_grad,
+        )
+
+    def update_eligibility_traces(self, ts: StreamQState, gamma: float, lambda_: float):
+        new_zw = update_eligibility_trace(ts.zw, gamma, lambda_, ts.td_grad)
+        return ts.replace(zw=new_zw)
+
+    def update_weights(self, ts: StreamQState, alpha: float, kappa: float):
+        new_net = ObGD(ts.zw, ts.net, ts.delta, alpha, kappa)
+        return ts.replace(net=new_net)
+    
+    def next_timestep(self, ts: StreamQState):
+        return ts.replace(current_timestep=ts.current_timestep + 1)
+    
+    def increment_episode_num(self, ts: StreamQState):
+        return ts.replace(current_episode_num=ts.current_episode_num + 1)
+
+    def post_weight_update_hook(self, ts: StreamQState) -> StreamQState:
+        new_zw = jt.map(lambda old: jax_lax.select(
+                jnp.logical_or(ts.explored, ts.done),
+                jnp.zeros_like(old),
+                old
+            ), ts.zw
+        )
+
+        return ts.replace(
+            zw=new_zw
+        )
 
 @jit
 def q_epsilon_greedy(q_network, state, epsilon: float, key: chex.PRNGKey):
@@ -97,6 +225,17 @@ def q_epsilon_greedy(q_network, state, epsilon: float, key: chex.PRNGKey):
     q_value = q_values[action]
     explored = action != greedy_action
     return action, q_value, explored
+
+
+@jit
+def get_delta(q_network, reward, gamma, done, s, a, sp):
+    q_sp = q_network(sp).max()
+    q_sa = q_network(s)[a]
+    return (
+        reward
+        + (1 - done) * jax_lax.stop_gradient(gamma * q_sp)
+        - q_sa
+    )
 
 
 def stream_q(
@@ -257,18 +396,42 @@ if __name__ == "__main__":
     q_network = QNetwork(obs_shape, hidden_layer_sizes, num_actions, key_reset)
 
     # Run the stream Q-learning algorithm
-    q_network = stream_q(
-        q_network,
-        env,
-        env_params,
+    # q_network = stream_q(
+    #     q_network,
+    #     env,
+    #     env_params,
+    #     gamma=0.99,
+    #     lambda_=0.8,
+    #     alpha=1.0,
+    #     kappa=2.0,
+    #     start_e=1.0,
+    #     end_e=0.2,
+    #     stop_exploring_timestep=2_000_000,
+    #     total_timesteps=4_000_000,
+    #     key=key_act
+    # )
+
+    learning_time = 50_000
+    algo = StreamQ(
         gamma=0.99,
         lambda_=0.8,
         alpha=1.0,
         kappa=2.0,
-        start_e=1.0,
-        end_e=0.2,
-        stop_exploring_timestep=2_000_000,
-        total_timesteps=4_000_000,
-        key=key_act
+        max_learning_timesteps=50_000
     )
 
+    algo_state = StreamQState(
+        net=q_network,
+        start_eps=1.0,
+        end_eps=0.01,
+        stop_exploring_timestep=0.5 * learning_time
+    )
+
+    algo.non_jitted_train(
+        key_act,
+        algo_state,
+        env,
+        env_params
+    )
+
+    print(algo)
