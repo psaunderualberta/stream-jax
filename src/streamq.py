@@ -1,5 +1,5 @@
 import equinox as eqx
-from jax import numpy as jnp, random as jax_random, tree as jt, jit, lax as jax_lax, value_and_grad, jax
+from jax import numpy as jnp, random as jax_random, tree as jt, jit, lax as jax_lax, value_and_grad, jax, vmap
 import chex
 from util import (
     LeakyReLU,
@@ -17,6 +17,7 @@ from gymnax import make
 from typing import Any
 from flax import struct
 from streamx import StreamXAlgorithm, StreamXTrainState
+from functools import partial
 
 jax.config.update('jax_default_device', jax.devices('cpu')[0])
 
@@ -81,6 +82,7 @@ class StreamQState(StreamXTrainState):
     action: int = struct.field(pytree_node=False, default=0)
     explored: bool = struct.field(pytree_node=False, default=False)
     reward: float = struct.field(pytree_node=False, default=0.0)
+    scaled_reward: float = struct.field(pytree_node=False, default=0.0)
     done: bool = struct.field(pytree_node=False, default=False)
 
     # eps-greedy
@@ -88,7 +90,7 @@ class StreamQState(StreamXTrainState):
     end_eps: float = struct.field(pytree_node=False, default=0.01)
     stop_exploring_timestep: float = struct.field(pytree_node=False, default=0.05)
     delta: float = struct.field(pytree_node=False, default=0)
-    td_grad: QNetwork = struct.field(pytree_node=False, default=None)
+    td_grad: QNetwork = struct.field(pytree_node=True, default=None)
     zw: QNetwork = struct.field(pytree_node=True, default=None)
 
     ### Default arguments common 
@@ -97,34 +99,73 @@ class StreamQState(StreamXTrainState):
     reward_stats: SampleMeanStats = struct.field(pytree_node=False, default=SampleMeanStats.new_params(()))
     obs_stats: SampleMeanStats = struct.field(pytree_node=False, default=SampleMeanStats.new_params(()))
     reward_trace: float = struct.field(pytree_node=False, default=0.0)
-    eval_callback: callable = struct.field(pytree_node=False, default=None)
     episode_length: int = struct.field(pytree_node=False, default=0)
 
     learning_mode: bool = struct.field(pytree_node=False, default=False)
-    key: chex.PRNGKey = struct.field(pytree_node=False, default=jax_random.PRNGKey(0))
+    key: chex.PRNGKey = struct.field(pytree_node=False, default=None)
 
 
 
 class StreamQ(StreamXAlgorithm):
-    def pre_episode_initialization(self, ts: StreamQState, obs: chex.Array, state: environment.EnvState):
+    def reset_env(self, ts: StreamQState, env, env_params):
+        key, key_ = jax_random.split(ts.key)
+        obs, state = env.reset(key_, env_params)
+        obs, obs_stats = normalize_observation(obs, ts.obs_stats)
+
         return ts.replace(
+            key=key,
             zw = init_eligibility_trace(ts.net),
             done=False,
             reward_trace=0.0,
             episode_length=0,
+            obs=obs,
+            state=state,
+            current_episode_num=ts.current_episode_num + 1,
+            obs_stats=obs_stats,
+        )
+
+    @partial(jit, static_argnums=(0, 3, 4))
+    def step_env(self, ts, action, env, env_params):
+        key, step_key = jax_random.split(ts.key)
+        next_obs, next_state, reward, done, _ = env.step(step_key, ts.state, action, env_params)
+        next_obs, obs_stats = normalize_observation(next_obs, ts.obs_stats)
+        scaled_reward, reward_trace, reward_stats = scale_reward(reward, ts.reward_stats, ts.reward_trace, done, self.gamma)
+
+        ts = ts.replace(
+            key=key,
+            next_obs=next_obs,
+            next_state=next_state,
+            reward=reward,
+            done=done,
+
+            scaled_reward=scaled_reward,
+            reward_trace=reward_trace,
+
+            obs_stats=obs_stats,
+            reward_stats=reward_stats
+        )
+
+        return self.scale_reward(ts)
+
+    def next_training_iteration(self, ts):
+        return ts.replace(
+            current_timestep=ts.current_timestep + 1,
+            episode_length=ts.episode_length + 1,
+            obs=ts.next_obs,
+            state=ts.next_state,
         )
 
     def get_action(self, ts: StreamQState):
         key, eps_key, action_key = jax_random.split(ts.key, 3)
         ts = ts.replace(key=key)
 
-        q_values = q_network(ts.state)
+        q_values = q_network(ts.obs)
         greedy_action = jnp.argmax(q_values, axis=-1)
 
-        eps = linear_epsilon_schedule(ts.start_eps, ts.end_eps, ts.stop_exploring_timestep, ts.current_timestep)
+        # eps = linear_epsilon_schedule(ts.start_eps, ts.end_eps, ts.stop_exploring_timestep, ts.current_timestep)
         explore = jnp.logical_and(
-            jnp.logical_not(ts.learning_mode),  # not in learning mode i.e. 
-            jax_random.uniform(eps_key) < eps,  # TODO: eplison calculator
+            ts.learning_mode,  # In learning mode i.e. we should explore sometimes
+            jax_random.uniform(eps_key) < 0.5,
         )
         action = jax_lax.select(
             explore,
@@ -132,47 +173,33 @@ class StreamQ(StreamXAlgorithm):
             greedy_action
         )
 
-        q_value = q_values[action]
         explored = action != greedy_action
-        return action, q_value, explored
-    
-    def update_env_step_outputs(
-            self,
-            ts: StreamQState,
-            next_obs: chex.Array,
-            next_state: environment.EnvState,
-            reward: float,
-            done: bool,
-            info: dict[Any, Any]
-        ):
-        return ts.replace(
-            next_obs=next_obs,
-            next_state=next_state,
-            reward=reward,
-            done=done,
+        return action, ts.replace(
+            explored=explored
         )
     
-    def normalize_observation(self, ts: StreamQState):
-        obs, obs_stats = normalize_observation(ts.obs, ts.obs_stats)
-        return ts.replace(
-            obs=obs,
-            obs_stats=obs_stats,
-        )
+    # def normalize_observation(self, ts: StreamQState):
+    #     obs, obs_stats = normalize_observation(ts.obs, ts.obs_stats)
+    #     return ts.replace(
+    #         obs=obs,
+    #         obs_stats=obs_stats,
+    #     )
 
     def scale_reward(self, ts: StreamQState):
-        reward, reward_stats = scale_reward(ts.reward, ts.reward_stats)
+        scaled_reward, reward_trace, reward_stats = scale_reward(ts.reward, ts.reward_stats, ts.reward_trace, ts.done, self.gamma)
         return ts.replace(
-            reward=reward,
+            scaled_reward=scaled_reward,
+            reward_trace=reward_trace,
             reward_stats=reward_stats
         )
 
-    def get_delta_and_traces(self, ts: StreamQState, gamma: float):
+    def get_delta_and_traces(self, ts: StreamQState):
         q_sp = ts.net(ts.next_obs).max()
         def get_delta(q, s):
             q_sa = q(s)[ts.action]
             return (
-                ts.reward
-                + (1 - ts.done) * jax_lax.stop_gradient(gamma * q_sp)
+                ts.scaled_reward
+                + (1 - ts.done) * jax_lax.stop_gradient(self.gamma * q_sp)
                 - q_sa
             )
 
@@ -182,21 +209,13 @@ class StreamQ(StreamXAlgorithm):
             td_grad=td_grad,
         )
 
-    def update_eligibility_traces(self, ts: StreamQState, gamma: float, lambda_: float):
-        new_zw = update_eligibility_trace(ts.zw, gamma, lambda_, ts.td_grad)
+    def update_eligibility_traces(self, ts: StreamQState):
+        new_zw = update_eligibility_trace(ts.zw, self.gamma, self.lambda_, ts.td_grad)
         return ts.replace(zw=new_zw)
 
-    def update_weights(self, ts: StreamQState, alpha: float, kappa: float):
-        new_net = ObGD(ts.zw, ts.net, ts.delta, alpha, kappa)
-        return ts.replace(net=new_net)
-    
-    def next_timestep(self, ts: StreamQState):
-        return ts.replace(current_timestep=ts.current_timestep + 1)
-    
-    def increment_episode_num(self, ts: StreamQState):
-        return ts.replace(current_episode_num=ts.current_episode_num + 1)
-
-    def post_weight_update_hook(self, ts: StreamQState) -> StreamQState:
+    def update_weights(self, ts: StreamQState):
+        new_net = ObGD(ts.zw, ts.net, ts.delta, self.alpha, self.kappa)
+        print(ts.explored, ts.done)
         new_zw = jt.map(lambda old: jax_lax.select(
                 jnp.logical_or(ts.explored, ts.done),
                 jnp.zeros_like(old),
@@ -205,8 +224,16 @@ class StreamQ(StreamXAlgorithm):
         )
 
         return ts.replace(
-            zw=new_zw
+            net=new_net,
+            zw=new_zw,
         )
+    
+    def next_timestep(self, ts: StreamQState):
+        return ts.replace(current_timestep=ts.current_timestep + 1)
+    
+    def increment_episode_num(self, ts: StreamQState):
+        return ts.replace(current_episode_num=ts.current_episode_num + 1)
+
 
 @jit
 def q_epsilon_greedy(q_network, state, epsilon: float, key: chex.PRNGKey):
@@ -387,44 +414,72 @@ if __name__ == "__main__":
     key, key_reset, key_act, key_step = jax_random.split(key, 4)
 
     # Instantiate the environment & its settings.
-    env, env_params = make("MountainCar-v0")
-    env_params = env_params.replace(max_steps_in_episode=10_000)
+    env, env_params = make("CartPole-v1")
+    # env_params = env_params.replace(max_steps_in_episode=10_000)
 
     obs_shape = env.observation_space(env_params).shape[0]
     num_actions = env.action_space(env_params).n
     hidden_layer_sizes = [32, 32]  # Example hidden layer sizes
     q_network = QNetwork(obs_shape, hidden_layer_sizes, num_actions, key_reset)
 
-    # Run the stream Q-learning algorithm
-    # q_network = stream_q(
-    #     q_network,
-    #     env,
-    #     env_params,
-    #     gamma=0.99,
-    #     lambda_=0.8,
-    #     alpha=1.0,
-    #     kappa=2.0,
-    #     start_e=1.0,
-    #     end_e=0.2,
-    #     stop_exploring_timestep=2_000_000,
-    #     total_timesteps=4_000_000,
-    #     key=key_act
-    # )
-
     learning_time = 50_000
-    algo = StreamQ(
-        gamma=0.99,
-        lambda_=0.8,
-        alpha=1.0,
-        kappa=2.0,
-        max_learning_timesteps=50_000
-    )
-
     algo_state = StreamQState(
         net=q_network,
         start_eps=1.0,
         end_eps=0.01,
         stop_exploring_timestep=0.5 * learning_time
+    )
+
+    def eval_callback(algo: StreamQ, ts: StreamQState, env, env_params):
+        ts = ts.replace(learning_mode=False)
+        rewards = []
+        lengths = []
+
+        def test_vmap(ts, key):
+            ts = ts.replace(key=key)
+            ts = algo.reset_env(ts, env, env_params)
+
+            @jit
+            def loop(tup):
+                _, ts = tup
+                action, ts = algo.get_action(ts)
+
+                # Step the environment
+                ts = algo.step_env(ts, action, env, env_params)
+
+                return ts.done, algo.next_training_iteration(ts)
+
+            loop((False, ts))
+            # (_, ts) = jax_lax.while_loop(
+            #     lambda args: jnp.logical_not(args[0]),
+            #     loop,
+            #     (False, ts)
+            # )
+
+            return ts.reward, ts.episode_length
+
+    
+        # keys = jax_random.split(key, algo.num_envs_per_eval)
+
+
+        # test_vmap = jit(  # vmap
+        #     test_vmap,
+        #     # in_axes=(None, 0)
+        # )  # )
+
+        rewards, lengths = test_vmap(ts, key)
+
+        print(f"{jnp.mean(jnp.array(rewards))} | {jnp.mean(jnp.array(lengths))}")
+
+
+    algo = StreamQ(
+        gamma=0.99,
+        lambda_=0.8,
+        alpha=1.0,
+        kappa=2.0,
+        max_learning_timesteps=50_000,
+        eval_freq=100,
+        eval_callback=eval_callback
     )
 
     algo.non_jitted_train(

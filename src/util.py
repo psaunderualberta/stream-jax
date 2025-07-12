@@ -88,7 +88,7 @@ class SampleMeanUpdate(eqx.Module):
         )
 
 
-@jit
+# @jit
 def normalize_observation(
     observation: chex.Array,
     observation_stats: SampleMeanStats
