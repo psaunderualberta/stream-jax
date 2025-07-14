@@ -16,7 +16,6 @@ from gymnax.environments import environment
 from gymnax import make
 from typing import Any
 from flax import struct
-from streamx import StreamXAlgorithm, StreamXTrainState
 from functools import partial
 
 jax.config.update('jax_default_device', jax.devices('cpu')[0])
@@ -142,6 +141,7 @@ class StreamQ(eqx.Module):
     end_e: float
     stop_exploring_timestep: float
     total_timesteps: int
+    eval_callback: Any = None
 
     def __init__(
         self,
@@ -156,6 +156,7 @@ class StreamQ(eqx.Module):
         end_e: float,
         stop_exploring_timestep: float,
         total_timesteps: int,
+        eval_callback: Any = None
     ):
         self.q_network = q_network
         self.env = env
@@ -168,6 +169,7 @@ class StreamQ(eqx.Module):
         self.end_e = end_e
         self.stop_exploring_timestep = stop_exploring_timestep
         self.total_timesteps = total_timesteps
+        self.eval_callback = eval_callback
     
     def train(self, input_key: chex.PRNGKey, jit_training: bool = False):
         def episode_train_body(carry: _StreamQEpisodeLoopState):
@@ -224,19 +226,6 @@ class StreamQ(eqx.Module):
                 reward_stats=reward_stats,
             )
 
-        @eqx.filter_jit
-        def train_episode(episode_state: _StreamQEpisodeLoopState):
-            return jax_lax.while_loop(
-                lambda carry: jnp.logical_not(carry.done),
-                episode_train_body,
-                episode_state
-            )
-
-        def non_train_episode(episode_state: _StreamQEpisodeLoopState):
-            while not episode_state.done:
-                episode_state = episode_train_body(episode_state)
-            return episode_state
-
         def outer_train(ls: _StreamQOuterLoopState):
             initial_loop_state = _StreamQEpisodeLoopState(
                 key=ls.key,
@@ -254,10 +243,11 @@ class StreamQ(eqx.Module):
             )
 
             # Run the episode loop
-            if jit_training:
-                episode_result = train_episode(initial_loop_state)
-            else:
-                episode_result = non_train_episode(initial_loop_state)
+            episode_result = jax_lax.while_loop(
+                lambda carry: jnp.logical_not(carry.done),
+                episode_train_body,
+                initial_loop_state
+            )
 
             # extract relevant info from environment, like PRNG key
             key = episode_result.key
@@ -271,14 +261,18 @@ class StreamQ(eqx.Module):
             obs, state = self.env.reset(reset_key, self.env_params)
             obs, obs_stats = normalize_observation(obs, obs_stats)
 
-            epsilon = linear_epsilon_schedule(self.start_e, self.end_e, self.stop_exploring_timestep, current_timestep)
-            jax.debug.print(
-                "Ep: {}. Episodic Return: {:.1f}. Percent elapsed: {:2.2f}%. Epsilon: {:.2f}",
-                ls.ep_num,
-                episode_result.reward_,
-                100 * current_timestep / self.total_timesteps,
-                epsilon
-            )
+            if callable(self.eval_callback):
+                # Call the evaluation callback if provided
+                self.eval_callback(q_network, self.env, self.env_params)
+            
+            # epsilon = linear_epsilon_schedule(self.start_e, self.end_e, self.stop_exploring_timestep, current_timestep)
+            # jax.debug.print(
+            #     "Ep: {}. Episodic Return: {:.1f}. Percent elapsed: {:2.2f}%. Epsilon: {:.2f}",
+            #     ls.ep_num,
+            #     episode_result.reward_,
+            #     100 * current_timestep / self.total_timesteps,
+            #     epsilon
+            # )
 
             return _StreamQOuterLoopState(
                 key=key,
@@ -292,7 +286,7 @@ class StreamQ(eqx.Module):
             )
         
         key, reset_key = jax_random.split(input_key)
-        obs, state = self.env.reset(key, self.env_params)
+        obs, state = self.env.reset(reset_key, self.env_params)
         obs_stats = SampleMeanStats.new_params(obs.shape)
         obs, obs_stats = normalize_observation(obs, obs_stats)
         reward_stats = SampleMeanStats.new_params(())
@@ -330,46 +324,37 @@ if __name__ == "__main__":
     learning_time = 50_000
 
     def eval_callback(agent, env, env_params):
-        rewards = []
-        lengths = []
-
         def test_vmap(ts, key):
-            ts = ts.replace(key=key)
             obs, state = env.reset(key, env_params)
-            ts = env.reset(ts, obs, state)
 
-            @eqx.filter_jit
             def loop(tup):
-                done, obs, state = tup
+                _, (obs, state), ep_reward, length = tup
                 action = agent.get_action(obs)
 
                 # Step the environment
                 next_obs, next_state, reward, done, _ = env.step(key, state, action, env_params)
 
-                return done
+                return done, (next_obs, next_state), ep_reward * 0.99 + reward, length + 1
 
             done = False
-            while not done:
-                done, ts, _ = loop((False, ts, state))
-            # (_, ts) = jax_lax.while_loop(
-            #     lambda args: jnp.logical_not(args[0]),
-            #     loop,
-            #     (False, ts)
-            # )
+            result = jax_lax.while_loop(
+                lambda args: jnp.logical_not(args[0]),
+                loop,
+                (done, (obs, state), 0.0, 0)
+            )
 
-            return ts.reward, ts.episode_length
+            return result[2], result[3]  # return reward and length
 
     
         # keys = jax_random.split(key, algo.num_envs_per_eval)
 
 
-        # test_vmap = jit(  # vmap
-        #     test_vmap,
-        #     # in_axes=(None, 0)
-        # )  # )
-
-        rewards, lengths = test_vmap(ts, key)
-
+        test_vmap = jit(  # vmap
+            test_vmap,
+            # in_axes=(None, 0)
+        )  # )
+        
+        rewards, lengths = test_vmap(key, key_act)
         jax.debug.print("{} | {}", jnp.mean(jnp.array(rewards)), jnp.mean(jnp.array(lengths)))
 
 
@@ -385,4 +370,5 @@ if __name__ == "__main__":
         end_e=0.01,
         stop_exploring_timestep=0.5 * learning_time,
         total_timesteps=learning_time,
+        eval_callback=eval_callback,
     ).train(key_reset, jit_training=True)
