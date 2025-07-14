@@ -107,9 +107,7 @@ class StreamQState(StreamXTrainState):
 
 
 class StreamQ(StreamXAlgorithm):
-    def reset_env(self, ts: StreamQState, env, env_params):
-        key, key_ = jax_random.split(ts.key)
-        obs, state = env.reset(key_, env_params)
+    def reset_env(self, ts: StreamQState, obs, state):
         obs, obs_stats = normalize_observation(obs, ts.obs_stats)
 
         return ts.replace(
@@ -124,14 +122,11 @@ class StreamQ(StreamXAlgorithm):
             obs_stats=obs_stats,
         )
 
-    @partial(jit, static_argnums=(0, 3, 4))
-    def step_env(self, ts, action, env, env_params):
-        key, step_key = jax_random.split(ts.key)
-        next_obs, next_state, reward, done, _ = env.step(step_key, ts.state, action, env_params)
+    def step_env(self, ts, next_obs, next_state, reward, done):
         next_obs, obs_stats = normalize_observation(next_obs, ts.obs_stats)
         scaled_reward, reward_trace, reward_stats = scale_reward(reward, ts.reward_stats, ts.reward_trace, done, self.gamma)
 
-        ts = ts.replace(
+        return ts.replace(
             key=key,
             next_obs=next_obs,
             next_state=next_state,
@@ -144,8 +139,6 @@ class StreamQ(StreamXAlgorithm):
             obs_stats=obs_stats,
             reward_stats=reward_stats
         )
-
-        return self.scale_reward(ts)
 
     def next_training_iteration(self, ts):
         return ts.replace(
@@ -162,10 +155,10 @@ class StreamQ(StreamXAlgorithm):
         q_values = q_network(ts.obs)
         greedy_action = jnp.argmax(q_values, axis=-1)
 
-        # eps = linear_epsilon_schedule(ts.start_eps, ts.end_eps, ts.stop_exploring_timestep, ts.current_timestep)
+        eps = linear_epsilon_schedule(ts.start_eps, ts.end_eps, ts.stop_exploring_timestep, ts.current_timestep)
         explore = jnp.logical_and(
             ts.learning_mode,  # In learning mode i.e. we should explore sometimes
-            jax_random.uniform(eps_key) < 0.5,
+            jax_random.uniform(eps_key) < eps,
         )
         action = jax_lax.select(
             explore,
@@ -177,13 +170,6 @@ class StreamQ(StreamXAlgorithm):
         return action, ts.replace(
             explored=explored
         )
-    
-    # def normalize_observation(self, ts: StreamQState):
-    #     obs, obs_stats = normalize_observation(ts.obs, ts.obs_stats)
-    #     return ts.replace(
-    #         obs=obs,
-    #         obs_stats=obs_stats,
-    #     )
 
     def scale_reward(self, ts: StreamQState):
         scaled_reward, reward_trace, reward_stats = scale_reward(ts.reward, ts.reward_stats, ts.reward_trace, ts.done, self.gamma)
@@ -213,9 +199,9 @@ class StreamQ(StreamXAlgorithm):
         new_zw = update_eligibility_trace(ts.zw, self.gamma, self.lambda_, ts.td_grad)
         return ts.replace(zw=new_zw)
 
+    # @eqx.filter_jit
     def update_weights(self, ts: StreamQState):
         new_net = ObGD(ts.zw, ts.net, ts.delta, self.alpha, self.kappa)
-        print(ts.explored, ts.done)
         new_zw = jt.map(lambda old: jax_lax.select(
                 jnp.logical_or(ts.explored, ts.done),
                 jnp.zeros_like(old),
@@ -437,19 +423,24 @@ if __name__ == "__main__":
 
         def test_vmap(ts, key):
             ts = ts.replace(key=key)
-            ts = algo.reset_env(ts, env, env_params)
+            obs, state = env.reset(key, env_params)
+            ts = algo.reset_env(ts, obs, state)
 
-            @jit
+            # @jit
             def loop(tup):
                 _, ts = tup
                 action, ts = algo.get_action(ts)
 
                 # Step the environment
-                ts = algo.step_env(ts, action, env, env_params)
+                key, ts = algo.get_key(ts)
+                next_obs, next_state, reward, done, _ = env.step(key, ts.state, action, env_params)
+                ts = algo.step_env(ts, next_obs, next_state, reward, done)
 
                 return ts.done, algo.next_training_iteration(ts)
 
-            loop((False, ts))
+            done = False
+            while not done:
+                done, ts = loop((False, ts))
             # (_, ts) = jax_lax.while_loop(
             #     lambda args: jnp.logical_not(args[0]),
             #     loop,

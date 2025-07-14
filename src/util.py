@@ -20,7 +20,7 @@ def is_none(x):
     return x is None
 
 
-# @eqx.filter_jit
+@eqx.filter_jit
 def ObGD(
     eligibility_trace: chex.Array,
     model: chex.Array,

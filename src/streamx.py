@@ -36,31 +36,36 @@ class StreamXAlgorithm(eqx.Module):
             env: environment.Environment,
             env_params: environment.EnvParams,
     ):
-        key, key_ = jax_random.split(key)
-        ts = ts.replace(key=key_)
-        ts = self.reset_env(ts, env, env_params)
+        ts = ts.replace(key=key)
+        key, ts = self.get_key(ts)
+        obs, state = env.reset(key, env_params)
+        ts = self.reset_env(ts, obs, state)
         while ts.current_timestep <= self.max_learning_timesteps:
-            eval_freq_counter = 0
-            while eval_freq_counter < self.eval_freq:
+            for _ in range(self.eval_freq):
                 action, ts = self.get_action(ts)
 
                 # Step the environment
-                ts = self.step_env(ts, action, env, env_params)
+                key, ts = self.get_key(ts)
+                next_obs, next_state, reward, done, _ = env.step(key, ts.state, action, env_params)
+                ts = self.step_env(ts, next_obs, next_state, reward, done)
 
                 ts = self.get_delta_and_traces(ts)
                 ts = self.update_eligibility_traces(ts)
                 ts = self.update_weights(ts)
 
                 if ts.done:
-                    ts = self.reset_env(ts, env, env_params)
+                    obs, state = env.reset(key, env_params)
+                    ts = self.reset_env(ts, obs, state)
                 else:
                     ts = self.next_training_iteration(ts)
-
-                eval_freq_counter += 1
 
             self.eval_callback(self, ts, env, env_params)
 
         return ts
+    
+    def get_key(self, ts: StreamXTrainState):
+        key, key_ = jax_random.split(ts.key)
+        return key_, ts.replace(key=key)
 
     def reset_env(self, ts: StreamXTrainState, env, env_params):
         raise NotImplementedError("reset_env")
