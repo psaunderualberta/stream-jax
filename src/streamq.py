@@ -65,6 +65,11 @@ class QNetwork(eqx.Module):
             x = layer(x)
         return x
     
+    @jit
+    def get_action(self, obs: chex.Array):
+        q_values = self(obs)
+        return jnp.argmax(q_values, axis=-1)
+    
     def num_actions(self):
         return self.layers[-1].weight.shape[0]
 
@@ -76,9 +81,7 @@ class StreamQState(StreamXTrainState):
 
     ### stream-q specific default arguments
     obs: chex.Array = struct.field(pytree_node=False, default=None)
-    state: environment.EnvState = struct.field(pytree_node=False, default=None)
     next_obs: chex.Array = struct.field(pytree_node=False, default=None)
-    next_state: environment.EnvState = struct.field(pytree_node=False, default=None)
     action: int = struct.field(pytree_node=False, default=0)
     explored: bool = struct.field(pytree_node=False, default=False)
     reward: float = struct.field(pytree_node=False, default=0.0)
@@ -105,48 +108,56 @@ class StreamQState(StreamXTrainState):
     key: chex.PRNGKey = struct.field(pytree_node=False, default=None)
 
 
+    @classmethod
+    def create(cls, *args, **kwargs):
+        
+        net=q_network,
+        start_eps=1.0,
+        end_eps=0.01,
+        stop_exploring_timestep=0.5 * learning_time,
+        obs_stats=SampleMeanStats.new_params((obs_shape,)),
+        reward_stats=SampleMeanStats.new_params(()),
+
 
 class StreamQ(StreamXAlgorithm):
-    def reset_env(self, ts: StreamQState, obs, state):
+    @partial(jit, static_argnums=(0,))
+    def reset_env(self, ts: StreamQState, obs):
         obs, obs_stats = normalize_observation(obs, ts.obs_stats)
 
-        return ts.replace(
-            key=key,
-            zw = init_eligibility_trace(ts.net),
-            done=False,
-            reward_trace=0.0,
-            episode_length=0,
-            obs=obs,
-            state=state,
-            current_episode_num=ts.current_episode_num + 1,
-            obs_stats=obs_stats,
-        )
+        return {
+            "key": key,
+            "zw": init_eligibility_trace(ts.net),
+            "done": False,
+            "reward_trace": 0.0,
+            "episode_length": 0,
+            "obs": obs,
+            "current_episode_num": ts.current_episode_num + 1,
+            "obs_stats": obs_stats,
+        }
 
-    def step_env(self, ts, next_obs, next_state, reward, done):
+    def step_env(self, ts, next_obs, reward, done):
         next_obs, obs_stats = normalize_observation(next_obs, ts.obs_stats)
         scaled_reward, reward_trace, reward_stats = scale_reward(reward, ts.reward_stats, ts.reward_trace, done, self.gamma)
 
-        return ts.replace(
-            key=key,
-            next_obs=next_obs,
-            next_state=next_state,
-            reward=reward,
-            done=done,
+        return {
+            "key": key,
+            "next_obs": next_obs,
+            "reward": reward,
+            "done": done,
 
-            scaled_reward=scaled_reward,
-            reward_trace=reward_trace,
+            "scaled_reward": scaled_reward,
+            "reward_trace": reward_trace,
 
-            obs_stats=obs_stats,
-            reward_stats=reward_stats
-        )
+            "obs_stats": obs_stats,
+            "reward_stats": reward_stats
+        }
 
     def next_training_iteration(self, ts):
-        return ts.replace(
-            current_timestep=ts.current_timestep + 1,
-            episode_length=ts.episode_length + 1,
-            obs=ts.next_obs,
-            state=ts.next_state,
-        )
+        return {
+            "current_timestep": ts.current_timestep + 1,
+            "episode_length": ts.episode_length + 1,
+            "obs": ts.next_obs,
+        }
 
     def get_action(self, ts: StreamQState):
         key, eps_key, action_key = jax_random.split(ts.key, 3)
@@ -167,37 +178,29 @@ class StreamQ(StreamXAlgorithm):
         )
 
         explored = action != greedy_action
-        return action, ts.replace(
-            explored=explored
-        )
+        return {
+            "action": action,
+            "explored": explored
+        }
 
-    def scale_reward(self, ts: StreamQState):
-        scaled_reward, reward_trace, reward_stats = scale_reward(ts.reward, ts.reward_stats, ts.reward_trace, ts.done, self.gamma)
-        return ts.replace(
-            scaled_reward=scaled_reward,
-            reward_trace=reward_trace,
-            reward_stats=reward_stats
-        )
+    # def scale_reward(self, ts: StreamQState):
+    #     scaled_reward, reward_trace, reward_stats = scale_reward(ts.reward, ts.reward_stats, ts.reward_trace, ts.done, self.gamma)
+    #     return ts.replace(
+    #         scaled_reward=scaled_reward,
+    #         reward_trace=reward_trace,
+    #         reward_stats=reward_stats
+    #     )
 
     def get_delta_and_traces(self, ts: StreamQState):
-        q_sp = ts.net(ts.next_obs).max()
-        def get_delta(q, s):
-            q_sa = q(s)[ts.action]
-            return (
-                ts.scaled_reward
-                + (1 - ts.done) * jax_lax.stop_gradient(self.gamma * q_sp)
-                - q_sa
-            )
-
-        td_error, td_grad = value_and_grad(get_delta)(ts.net, ts.obs)
-        return ts.replace(
-            delta=td_error,
-            td_grad=td_grad,
-        )
+        td_error, td_grad = value_and_grad(get_delta)(ts.net, ts.scaled_reward, self.gamma, ts.done, ts.obs, ts.action, ts.next_obs)
+        return {
+            "delta": td_error,
+            "td_grad": td_grad,
+        }
 
     def update_eligibility_traces(self, ts: StreamQState):
         new_zw = update_eligibility_trace(ts.zw, self.gamma, self.lambda_, ts.td_grad)
-        return ts.replace(zw=new_zw)
+        return {"zw": new_zw}
 
     # @eqx.filter_jit
     def update_weights(self, ts: StreamQState):
@@ -209,16 +212,16 @@ class StreamQ(StreamXAlgorithm):
             ), ts.zw
         )
 
-        return ts.replace(
-            net=new_net,
-            zw=new_zw,
-        )
+        return {
+            "net": new_net,
+            "zw": new_zw,
+        }
     
     def next_timestep(self, ts: StreamQState):
-        return ts.replace(current_timestep=ts.current_timestep + 1)
+        return {"current_timestep": ts.current_timestep + 1}
     
     def increment_episode_num(self, ts: StreamQState):
-        return ts.replace(current_episode_num=ts.current_episode_num + 1)
+        return {"current_episode_num": ts.current_episode_num + 1}
 
 
 @jit
@@ -251,147 +254,213 @@ def get_delta(q_network, reward, gamma, done, s, a, sp):
     )
 
 
-def stream_q(
-    q_network: QNetwork,
-    env: environment.Environment,
-    env_params: environment.EnvParams,
-    gamma: float,
-    lambda_: float,
-    alpha: float,
-    kappa: float,
-    start_e: float,
-    end_e: float,
-    stop_exploring_timestep: float,
-    total_timesteps: int,
-    key: chex.PRNGKey,
-):
-
-    class LoopState(eqx.Module):
-        key: chex.PRNGKey
-        q_network: QNetwork
-        done: bool
-        obs: chex.Array
-        state: Any
-        z_w: Any
-        reward_: float
-        reward_trace: float
-        obs_stats: SampleMeanStats
-        reward_stats: SampleMeanStats
-        length: int
-        global_timestep: int
-
-    def while_loop_body(carry: LoopState):
-        # extract carry elements
-        key = carry.key
-        obs, state = carry.obs, carry.state
-        q_network, z_w = carry.q_network, carry.z_w
-        obs_stats = carry.obs_stats
-        reward_stats = carry.reward_stats
-        reward_trace = carry.reward_trace
-        global_timestep = carry.global_timestep + 1
-
-        key, action_key = jax_random.split(key)
-
-        # Select an action using epsilon-greedy policy.
-        eps = linear_epsilon_schedule(start_e, end_e, stop_exploring_timestep, global_timestep)
-        action, q_value, explored = q_epsilon_greedy(q_network, obs, eps, action_key)
-
-        # Step the environment.
-        key, step_key = jax_random.split(key)
-        next_obs, next_state, reward, done, _ = env.step(step_key, state, action, env_params)
-
-        # normalize observation & reward
-        next_obs, obs_stats = normalize_observation(next_obs, obs_stats)
-        scaled_reward, reward_trace, reward_stats = scale_reward(reward, reward_stats, reward_trace, done, gamma)
-
-        # Update eligibility trace
-        td_error, td_grad = value_and_grad(get_delta)(q_network, scaled_reward, gamma, done, obs, action, next_obs)
-        z_w = update_eligibility_trace(z_w, gamma, lambda_, td_grad)
-
-        # Update Q-network using ObGD
-        q_network = ObGD(z_w, q_network, td_error, alpha, kappa)
-
-        # reset eligibility trace if an exploration occurred
-        z_w = jt.map(lambda old: jax_lax.select(
-                jnp.logical_or(explored, done),
-                jnp.zeros_like(old),
-                old
-            ), z_w
-        )
+class _StreamQEpisodeLoopState(eqx.Module):
+    key: chex.PRNGKey
+    q_network: QNetwork
+    done: bool
+    obs: chex.Array
+    state: Any
+    z_w: Any
+    reward_: float
+    reward_trace: float
+    obs_stats: SampleMeanStats
+    reward_stats: SampleMeanStats
+    length: int
+    global_timestep: int
 
 
-        return LoopState(
-            key=key,
-            done=done,
-            obs=next_obs,
-            state=next_state,
-            z_w=z_w,
-            q_network=q_network,
-            reward_=carry.reward_ * gamma + reward,
-            reward_trace=reward_trace,
-            global_timestep=global_timestep,
-            length=carry.length + 1,
-            obs_stats=obs_stats,
-            reward_stats=reward_stats,
-        )
+class _StreamQOuterLoopState(eqx.Module):
+    key: chex.PRNGKey
+    q_network: QNetwork
+    obs: chex.Array
+    state: Any
+    reward_stats: SampleMeanStats
+    obs_stats: SampleMeanStats
+    current_timestep: int = 0
+    ep_num: int = 0
 
-    @eqx.filter_jit
-    def jitted_while_loop(episode_state: LoopState):
-        return jax_lax.while_loop(
-            lambda carry: jnp.logical_not(carry.done),
-            while_loop_body,
-            episode_state
-        )
 
-    def non_jitted_while_loop(episode_state: LoopState):
-        while not episode_state.done:
-            episode_state = while_loop_body(episode_state)
-        return episode_state
+class StreamQ(eqx.Module):
+    q_network: QNetwork
+    env: environment.Environment
+    env_params: environment.EnvParams
+    gamma: float
+    lambda_: float
+    alpha: float
+    kappa: float
+    start_e: float
+    end_e: float
+    stop_exploring_timestep: float
+    total_timesteps: int
 
-    i = 0
-    current_timestep = 0
-    key, reset_key = jax_random.split(key)
-    obs, state = env.reset(key, env_params)
-    obs_stats = SampleMeanStats.new_params(obs.shape)
-    obs, obs_stats = normalize_observation(obs, obs_stats)
-    reward_stats = SampleMeanStats.new_params(())
-    while current_timestep < total_timesteps:
-        initial_loop_state = LoopState(
-            key=key,
-            done=False,
-            obs=obs,
-            state=state,
-            z_w=init_eligibility_trace(q_network),
-            q_network=q_network,
-            reward_=0.0,
-            reward_trace=0.0,
-            global_timestep=current_timestep,
-            length=0.0,
-            obs_stats=obs_stats,
-            reward_stats=reward_stats,
-        )
+    def __init__(
+        self,
+        q_network: QNetwork,
+        env: environment.Environment,
+        env_params: environment.EnvParams,
+        gamma: float,
+        lambda_: float,
+        alpha: float,
+        kappa: float,
+        start_e: float,
+        end_e: float,
+        stop_exploring_timestep: float,
+        total_timesteps: int,
+    ):
+        self.q_network = q_network
+        self.env = env
+        self.env_params = env_params
+        self.gamma = gamma
+        self.lambda_ = lambda_
+        self.alpha = alpha
+        self.kappa = kappa
+        self.start_e = start_e
+        self.end_e = end_e
+        self.stop_exploring_timestep = stop_exploring_timestep
+        self.total_timesteps = total_timesteps
+    
+    def train(self, input_key: chex.PRNGKey, jit_training: bool = False):
+        def episode_train_body(carry: _StreamQEpisodeLoopState):
+            # extract carry elements
+            key = carry.key
+            obs, state = carry.obs, carry.state
+            q_network, z_w = carry.q_network, carry.z_w
+            obs_stats = carry.obs_stats
+            reward_stats = carry.reward_stats
+            reward_trace = carry.reward_trace
+            global_timestep = carry.global_timestep + 1
 
-        # episode_result = non_jitted_while_loop(initial_loop_state)
-        episode_result = jitted_while_loop(initial_loop_state)
+            key, action_key = jax_random.split(key)
 
-        # extract relevant info from environment, like PRNG key
-        key = episode_result.key
-        q_network = episode_result.q_network
-        current_timestep += episode_result.length
-        obs_stats = episode_result.obs_stats
-        reward_stats = episode_result.reward_stats
+            # Select an action using epsilon-greedy policy.
+            eps = linear_epsilon_schedule(self.start_e, self.end_e, self.stop_exploring_timestep, global_timestep)
+            action, q_value, explored = q_epsilon_greedy(q_network, obs, eps, action_key)
 
-        # reset environment
-        key, reset_key = jax_random.split(key)
-        obs, state = env.reset(reset_key, env_params)
+            # Step the environment.
+            key, step_key = jax_random.split(key)
+            next_obs, next_state, reward, done, _ = self.env.step(step_key, state, action, self.env_params)
+
+            # normalize observation & reward
+            next_obs, obs_stats = normalize_observation(next_obs, obs_stats)
+            scaled_reward, reward_trace, reward_stats = scale_reward(reward, reward_stats, reward_trace, done, self.gamma)
+
+            # Update eligibility trace
+            td_error, td_grad = value_and_grad(get_delta)(q_network, scaled_reward, self.gamma, done, obs, action, next_obs)
+            z_w = update_eligibility_trace(z_w, self.gamma, self.lambda_, td_grad)
+
+            # Update Q-network using ObGD
+            q_network = ObGD(z_w, q_network, td_error, self.alpha, self.kappa)
+
+            # reset eligibility trace if an exploration occurred
+            z_w = jt.map(lambda old: jax_lax.select(
+                    jnp.logical_or(explored, done),
+                    jnp.zeros_like(old),
+                    old
+                ), z_w
+            )
+
+            return _StreamQEpisodeLoopState(
+                key=key,
+                done=done,
+                obs=next_obs,
+                state=next_state,
+                z_w=z_w,
+                q_network=q_network,
+                reward_=carry.reward_ * self.gamma + reward,
+                reward_trace=reward_trace,
+                global_timestep=global_timestep,
+                length=carry.length + 1,
+                obs_stats=obs_stats,
+                reward_stats=reward_stats,
+            )
+
+        @eqx.filter_jit
+        def train_episode(episode_state: _StreamQEpisodeLoopState):
+            return jax_lax.while_loop(
+                lambda carry: jnp.logical_not(carry.done),
+                episode_train_body,
+                episode_state
+            )
+
+        def non_train_episode(episode_state: _StreamQEpisodeLoopState):
+            while not episode_state.done:
+                episode_state = episode_train_body(episode_state)
+            return episode_state
+
+        def outer_train(ls: _StreamQOuterLoopState):
+            initial_loop_state = _StreamQEpisodeLoopState(
+                key=ls.key,
+                done=False,
+                obs=ls.obs,
+                state=ls.state,
+                z_w=init_eligibility_trace(ls.q_network),
+                q_network=ls.q_network,
+                reward_=0.0,
+                reward_trace=0.0,
+                global_timestep=ls.current_timestep,
+                length=0.0,
+                obs_stats=ls.obs_stats,
+                reward_stats=ls.reward_stats,
+            )
+
+            # Run the episode loop
+            if jit_training:
+                episode_result = train_episode(initial_loop_state)
+            else:
+                episode_result = non_train_episode(initial_loop_state)
+
+            # extract relevant info from environment, like PRNG key
+            key = episode_result.key
+            q_network = episode_result.q_network
+            current_timestep = ls.current_timestep + episode_result.length
+            obs_stats = episode_result.obs_stats
+            reward_stats = episode_result.reward_stats
+
+            # reset environment
+            key, reset_key = jax_random.split(key)
+            obs, state = self.env.reset(reset_key, self.env_params)
+            obs, obs_stats = normalize_observation(obs, obs_stats)
+
+            epsilon = linear_epsilon_schedule(self.start_e, self.end_e, self.stop_exploring_timestep, current_timestep)
+            jax.debug.print(
+                "Ep: {}. Episodic Return: {:.1f}. Percent elapsed: {:2.2f}%. Epsilon: {:.2f}",
+                ls.ep_num,
+                episode_result.reward_,
+                100 * current_timestep / self.total_timesteps,
+                epsilon
+            )
+
+            return _StreamQOuterLoopState(
+                key=key,
+                q_network=q_network,
+                current_timestep=current_timestep,
+                obs=obs,
+                state=state,
+                reward_stats=reward_stats,
+                obs_stats=obs_stats,
+                ep_num=ls.ep_num + 1,
+            )
+        
+        key, reset_key = jax_random.split(input_key)
+        obs, state = self.env.reset(key, self.env_params)
+        obs_stats = SampleMeanStats.new_params(obs.shape)
         obs, obs_stats = normalize_observation(obs, obs_stats)
+        reward_stats = SampleMeanStats.new_params(())
 
-        epsilon = linear_epsilon_schedule(start_e, end_e, stop_exploring_timestep, current_timestep)
-        print(f"Ep: {i}. Episodic Return: {episode_result.reward_:.1f}. Percent elapsed: {100 * current_timestep / total_timesteps:2.2f}%. Epsilon: {epsilon:.2f}")
+        training_result = jax.lax.while_loop(
+            lambda loop_state: loop_state.current_timestep < self.total_timesteps,
+            outer_train,
+            _StreamQOuterLoopState(
+                key=key,
+                q_network=self.q_network,
+                obs=obs,
+                state=state,
+                reward_stats=reward_stats,
+                obs_stats=obs_stats,
+            )
+        )
 
-        i += 1
-
-    return q_network
+        return training_result.q_network
 
 if __name__ == "__main__":
     # Example usage
@@ -409,38 +478,29 @@ if __name__ == "__main__":
     q_network = QNetwork(obs_shape, hidden_layer_sizes, num_actions, key_reset)
 
     learning_time = 50_000
-    algo_state = StreamQState(
-        net=q_network,
-        start_eps=1.0,
-        end_eps=0.01,
-        stop_exploring_timestep=0.5 * learning_time
-    )
 
-    def eval_callback(algo: StreamQ, ts: StreamQState, env, env_params):
-        ts = ts.replace(learning_mode=False)
+    def eval_callback(agent, env, env_params):
         rewards = []
         lengths = []
 
         def test_vmap(ts, key):
             ts = ts.replace(key=key)
             obs, state = env.reset(key, env_params)
-            ts = algo.reset_env(ts, obs, state)
+            ts = env.reset(ts, obs, state)
 
-            # @jit
+            @eqx.filter_jit
             def loop(tup):
-                _, ts = tup
-                action, ts = algo.get_action(ts)
+                done, obs, state = tup
+                action = agent.get_action(obs)
 
                 # Step the environment
-                key, ts = algo.get_key(ts)
-                next_obs, next_state, reward, done, _ = env.step(key, ts.state, action, env_params)
-                ts = algo.step_env(ts, next_obs, next_state, reward, done)
+                next_obs, next_state, reward, done, _ = env.step(key, state, action, env_params)
 
-                return ts.done, algo.next_training_iteration(ts)
+                return done
 
             done = False
             while not done:
-                done, ts = loop((False, ts))
+                done, ts, _ = loop((False, ts, state))
             # (_, ts) = jax_lax.while_loop(
             #     lambda args: jnp.logical_not(args[0]),
             #     loop,
@@ -460,24 +520,19 @@ if __name__ == "__main__":
 
         rewards, lengths = test_vmap(ts, key)
 
-        print(f"{jnp.mean(jnp.array(rewards))} | {jnp.mean(jnp.array(lengths))}")
+        jax.debug.print("{} | {}", jnp.mean(jnp.array(rewards)), jnp.mean(jnp.array(lengths)))
 
 
-    algo = StreamQ(
+    StreamQ(
+        q_network=q_network,
+        env=env,
+        env_params=env_params,
         gamma=0.99,
         lambda_=0.8,
         alpha=1.0,
         kappa=2.0,
-        max_learning_timesteps=50_000,
-        eval_freq=100,
-        eval_callback=eval_callback
-    )
-
-    algo.non_jitted_train(
-        key_act,
-        algo_state,
-        env,
-        env_params
-    )
-
-    print(algo)
+        start_e=1.0,
+        end_e=0.01,
+        stop_exploring_timestep=0.5 * learning_time,
+        total_timesteps=learning_time,
+    ).train(key_reset, jit_training=True)
