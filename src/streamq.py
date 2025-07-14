@@ -113,7 +113,6 @@ class _StreamQEpisodeLoopState(eqx.Module):
     reward_trace: float
     obs_stats: SampleMeanStats
     reward_stats: SampleMeanStats
-    length: int
     global_timestep: int
 
     # TODO: Implement step & reset methods
@@ -230,7 +229,6 @@ class StreamQ(eqx.Module):
                 q_network=q_network,
                 reward_trace=reward_trace,
                 global_timestep=global_timestep,
-                length=carry.length + 1,
                 obs_stats=obs_stats,
                 reward_stats=reward_stats,
             )
@@ -245,7 +243,6 @@ class StreamQ(eqx.Module):
                 q_network=ls.q_network,
                 reward_trace=0.0,
                 global_timestep=ls.current_timestep,
-                length=0.0,
                 obs_stats=ls.obs_stats,
                 reward_stats=ls.reward_stats,
             )
@@ -271,7 +268,7 @@ class StreamQ(eqx.Module):
             loop_result = _StreamQOuterLoopState(
                 key=key,
                 q_network=episode_result.q_network,
-                current_timestep=ls.current_timestep + episode_result.length,
+                current_timestep=episode_result.global_timestep,
                 obs=obs,
                 state=state,
                 reward_stats=reward_stats,
@@ -313,17 +310,17 @@ if __name__ == "__main__":
     key, key_reset, key_act, key_step = jax_random.split(key, 4)
 
     # Instantiate the environment & its settings.
-    env, env_params = make("CartPole-v1")
-    # env_params = env_params.replace(max_steps_in_episode=10_000)
+    env, env_params = make("MountainCar-v0")
+    env_params = env_params.replace(max_steps_in_episode=10_000)
 
     obs_shape = env.observation_space(env_params).shape[0]
     num_actions = env.action_space(env_params).n
     hidden_layer_sizes = [32, 32]  # Example hidden layer sizes
     q_network = QNetwork(obs_shape, hidden_layer_sizes, num_actions, key_reset)
 
-    learning_time = 50_000
+    learning_time = 1_000_000
 
-    def eval_callback(agent, env, env_params, ke):
+    def eval_callback(agent, env, env_params, key):
         def test_vmap(key):
             obs, state = env.reset(key, env_params)
             obs, _ = normalize_observation(obs, agent.obs_stats)
