@@ -65,7 +65,7 @@ class QNetwork(eqx.Module):
         return x
     
     @jit
-    def get_action(self, obs: chex.Array):
+    def get_action(self, obs: chex.Array, _: chex.PRNGKey = None):
         q_values = self(obs)
         return jnp.argmax(q_values, axis=-1)
     
@@ -110,12 +110,18 @@ class _StreamQEpisodeLoopState(eqx.Module):
     obs: chex.Array
     state: Any
     z_w: Any
-    reward_: float
     reward_trace: float
     obs_stats: SampleMeanStats
     reward_stats: SampleMeanStats
     length: int
     global_timestep: int
+
+    # TODO: Implement step & reset methods
+    def step(self):
+        pass
+
+    def reset(self):
+        pass
 
 
 class _StreamQOuterLoopState(eqx.Module):
@@ -142,6 +148,7 @@ class StreamQ(eqx.Module):
     stop_exploring_timestep: float
     total_timesteps: int
     eval_callback: Any = None
+    num_envs_per_eval: int = 8
 
     def __init__(
         self,
@@ -156,7 +163,8 @@ class StreamQ(eqx.Module):
         end_e: float,
         stop_exploring_timestep: float,
         total_timesteps: int,
-        eval_callback: Any = None
+        eval_callback: Any = None,
+        num_envs_per_eval: int = 8
     ):
         self.q_network = q_network
         self.env = env
@@ -170,8 +178,10 @@ class StreamQ(eqx.Module):
         self.stop_exploring_timestep = stop_exploring_timestep
         self.total_timesteps = total_timesteps
         self.eval_callback = eval_callback
+        self.num_envs_per_eval = num_envs_per_eval
     
-    def train(self, input_key: chex.PRNGKey, jit_training: bool = False):
+    # @eqx.filter_jit
+    def train(self, input_key: chex.PRNGKey):
         def episode_train_body(carry: _StreamQEpisodeLoopState):
             # extract carry elements
             key = carry.key
@@ -218,7 +228,6 @@ class StreamQ(eqx.Module):
                 state=next_state,
                 z_w=z_w,
                 q_network=q_network,
-                reward_=carry.reward_ * self.gamma + reward,
                 reward_trace=reward_trace,
                 global_timestep=global_timestep,
                 length=carry.length + 1,
@@ -234,7 +243,6 @@ class StreamQ(eqx.Module):
                 state=ls.state,
                 z_w=init_eligibility_trace(ls.q_network),
                 q_network=ls.q_network,
-                reward_=0.0,
                 reward_trace=0.0,
                 global_timestep=ls.current_timestep,
                 length=0.0,
@@ -251,8 +259,6 @@ class StreamQ(eqx.Module):
 
             # extract relevant info from environment, like PRNG key
             key = episode_result.key
-            q_network = episode_result.q_network
-            current_timestep = ls.current_timestep + episode_result.length
             obs_stats = episode_result.obs_stats
             reward_stats = episode_result.reward_stats
 
@@ -261,29 +267,23 @@ class StreamQ(eqx.Module):
             obs, state = self.env.reset(reset_key, self.env_params)
             obs, obs_stats = normalize_observation(obs, obs_stats)
 
-            if callable(self.eval_callback):
-                # Call the evaluation callback if provided
-                self.eval_callback(q_network, self.env, self.env_params)
-            
-            # epsilon = linear_epsilon_schedule(self.start_e, self.end_e, self.stop_exploring_timestep, current_timestep)
-            # jax.debug.print(
-            #     "Ep: {}. Episodic Return: {:.1f}. Percent elapsed: {:2.2f}%. Epsilon: {:.2f}",
-            #     ls.ep_num,
-            #     episode_result.reward_,
-            #     100 * current_timestep / self.total_timesteps,
-            #     epsilon
-            # )
-
-            return _StreamQOuterLoopState(
+            key, key_eval = jax_random.split(key)
+            loop_result = _StreamQOuterLoopState(
                 key=key,
-                q_network=q_network,
-                current_timestep=current_timestep,
+                q_network=episode_result.q_network,
+                current_timestep=ls.current_timestep + episode_result.length,
                 obs=obs,
                 state=state,
                 reward_stats=reward_stats,
                 obs_stats=obs_stats,
                 ep_num=ls.ep_num + 1,
             )
+
+            if callable(self.eval_callback):
+                # Call the evaluation callback if provided
+                self.eval_callback(loop_result, self.env, self.env_params, key_eval)
+            
+            return loop_result
         
         key, reset_key = jax_random.split(input_key)
         obs, state = self.env.reset(reset_key, self.env_params)
@@ -323,16 +323,18 @@ if __name__ == "__main__":
 
     learning_time = 50_000
 
-    def eval_callback(agent, env, env_params):
-        def test_vmap(ts, key):
+    def eval_callback(agent, env, env_params, ke):
+        def test_vmap(key):
             obs, state = env.reset(key, env_params)
+            obs, _ = normalize_observation(obs, agent.obs_stats)
 
             def loop(tup):
                 _, (obs, state), ep_reward, length = tup
-                action = agent.get_action(obs)
+                action = agent.q_network.get_action(obs)
 
                 # Step the environment
                 next_obs, next_state, reward, done, _ = env.step(key, state, action, env_params)
+                next_obs, _ = normalize_observation(next_obs, agent.obs_stats)
 
                 return done, (next_obs, next_state), ep_reward * 0.99 + reward, length + 1
 
@@ -346,16 +348,15 @@ if __name__ == "__main__":
             return result[2], result[3]  # return reward and length
 
     
-        # keys = jax_random.split(key, algo.num_envs_per_eval)
+        keys = jax_random.split(key, 8)
 
 
-        test_vmap = jit(  # vmap
+        test_vmap = jit(vmap(
             test_vmap,
-            # in_axes=(None, 0)
-        )  # )
+        ))
         
-        rewards, lengths = test_vmap(key, key_act)
-        jax.debug.print("{} | {}", jnp.mean(jnp.array(rewards)), jnp.mean(jnp.array(lengths)))
+        rewards, lengths = test_vmap(keys)
+        jax.debug.print("Ep: {} | Rewards: {:.2f} | Avg. Length: {}", agent.current_timestep.astype(int), jnp.mean(jnp.array(rewards)), jnp.mean(jnp.array(lengths)))
 
 
     StreamQ(
@@ -371,4 +372,4 @@ if __name__ == "__main__":
         stop_exploring_timestep=0.5 * learning_time,
         total_timesteps=learning_time,
         eval_callback=eval_callback,
-    ).train(key_reset, jit_training=True)
+    ).train(key_reset)
