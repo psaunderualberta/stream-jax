@@ -271,162 +271,7 @@ class StreamQ:
             length=self.total_timesteps // self.eval_freq
         )
 
-            # # Reset environment if done
-            # if train_state.state_transition.done:
-            #     rng, rng_reset = jax_random.split(train_state.rng_ts)
-            #     obs, state = self.env.reset(rng_reset, self.env_params)
-            #     train_state = train_state.replace(
-            #         obs=obs,
-            #         state=state,
-            #         state_transition=train_state.state_transition.replace(obs=obs, state=state)
-            #     )
-
-            # # Optionally visualize or log the training progress
-            # if train_state.global_timestep % self.eval_freq == 0:
-
         return train_result
-
-def stream_q(
-    q_network: QNetwork,
-    env: environment.Environment,
-    env_params: environment.EnvParams,
-    gamma: float,
-    lambda_: float,
-    alpha: float,
-    kappa: float,
-    start_e: float,
-    end_e: float,
-    stop_exploring_timestep: float,
-    total_timesteps: int,
-    key: chex.PRNGKey,
-):
-
-    class LoopState(eqx.Module):
-        key: chex.PRNGKey
-        q_network: QNetwork
-        done: bool
-        obs: chex.Array
-        state: Any
-        z_w: Any
-        reward_: float
-        reward_trace: float
-        obs_stats: SampleMeanStats
-        reward_stats: SampleMeanStats
-        length: int
-        global_timestep: int
-
-    def while_loop_body(carry: LoopState):
-        # extract carry elements
-        key = carry.key
-        obs, state = carry.obs, carry.state
-        q_network, z_w = carry.q_network, carry.z_w
-        obs_stats = carry.obs_stats
-        reward_stats = carry.reward_stats
-        reward_trace = carry.reward_trace
-        global_timestep = carry.global_timestep + 1
-
-        key, action_key = jax_random.split(key)
-
-        # Select an action using epsilon-greedy policy.
-        eps = linear_epsilon_schedule(start_e, end_e, stop_exploring_timestep, global_timestep)
-        action, q_value, explored = q_epsilon_greedy(q_network, obs, eps, action_key)
-
-        # Step the environment.
-        key, step_key = jax_random.split(key)
-        next_obs, next_state, reward, done, _ = env.step(step_key, state, action, env_params)
-
-        # normalize observation & reward
-        next_obs, obs_stats = normalize_observation(next_obs, obs_stats)
-        scaled_reward, reward_trace, reward_stats = scale_reward(reward, reward_stats, reward_trace, done, gamma)
-
-        # Update eligibility trace
-        td_error, td_grad = value_and_grad(get_delta)(q_network, scaled_reward, gamma, done, obs, action, next_obs)
-        z_w = update_eligibility_trace(z_w, gamma, lambda_, td_grad)
-
-        # Update Q-network using ObGD
-        q_network = ObGD(z_w, q_network, td_error, alpha, kappa)
-
-        # reset eligibility trace if an exploration occurred
-        z_w = jt.map(lambda old: jax_lax.select(
-                jnp.logical_or(explored, done),
-                jnp.zeros_like(old),
-                old
-            ), z_w
-        )
-
-
-        return LoopState(
-            key=key,
-            done=done,
-            obs=next_obs,
-            state=next_state,
-            z_w=z_w,
-            q_network=q_network,
-            reward_=carry.reward_ * gamma + reward,
-            reward_trace=reward_trace,
-            global_timestep=global_timestep,
-            length=carry.length + 1,
-            obs_stats=obs_stats,
-            reward_stats=reward_stats,
-        )
-
-    @eqx.filter_jit
-    def jitted_while_loop(episode_state: LoopState):
-        return jax_lax.while_loop(
-            lambda carry: jnp.logical_not(carry.done),
-            while_loop_body,
-            episode_state
-        )
-
-    def non_jitted_while_loop(episode_state: LoopState):
-        while not episode_state.done:
-            episode_state = while_loop_body(episode_state)
-        return episode_state
-
-    i = 0
-    current_timestep = 0
-    key, reset_key = jax_random.split(key)
-    obs, state = env.reset(key, env_params)
-    obs_stats = SampleMeanStats.new_params(obs.shape)
-    obs, obs_stats = normalize_observation(obs, obs_stats)
-    reward_stats = SampleMeanStats.new_params(())
-    while current_timestep < total_timesteps:
-        initial_loop_state = LoopState(
-            key=key,
-            done=False,
-            obs=obs,
-            state=state,
-            z_w=init_eligibility_trace(q_network),
-            q_network=q_network,
-            reward_=0.0,
-            reward_trace=0.0,
-            global_timestep=current_timestep,
-            length=0.0,
-            obs_stats=obs_stats,
-            reward_stats=reward_stats,
-        )
-
-        # episode_result = non_jitted_while_loop(initial_loop_state)
-        episode_result = jitted_while_loop(initial_loop_state)
-
-        # extract relevant info from environment, like PRNG key
-        key = episode_result.key
-        q_network = episode_result.q_network
-        current_timestep += episode_result.length
-        obs_stats = episode_result.obs_stats
-        reward_stats = episode_result.reward_stats
-
-        # reset environment
-        key, reset_key = jax_random.split(key)
-        obs, state = env.reset(reset_key, env_params)
-        obs, obs_stats = normalize_observation(obs, obs_stats)
-
-        epsilon = linear_epsilon_schedule(start_e, end_e, stop_exploring_timestep, current_timestep)
-        print(f"Ep: {i}. Episodic Return: {episode_result.reward_:.1f}. Percent elapsed: {100 * current_timestep / total_timesteps:2.2f}%. Epsilon: {epsilon:.2f}")
-
-        i += 1
-
-    return q_network
 
 if __name__ == "__main__":
     # Example usage
@@ -470,7 +315,7 @@ if __name__ == "__main__":
         jax.debug.print(
             "Episodic Return: {:.1f}. Percent elapsed: {:2.2f}%. Epsilon: {:.2f}",
             trans.reward,
-            time_elapsed,
+            ts.obs_stats.count,
             linear_epsilon_schedule(
                 algo.start_e, algo.end_e, algo.stop_exploring_timestep, ts.global_timestep
             )
@@ -494,3 +339,147 @@ if __name__ == "__main__":
         total_timesteps=500_000,
         eval_callback=eval_callback
     ).train(key_act)
+
+
+
+# def stream_q(
+#     q_network: QNetwork,
+#     env: environment.Environment,
+#     env_params: environment.EnvParams,
+#     gamma: float,
+#     lambda_: float,
+#     alpha: float,
+#     kappa: float,
+#     start_e: float,
+#     end_e: float,
+#     stop_exploring_timestep: float,
+#     total_timesteps: int,
+#     key: chex.PRNGKey,
+# ):
+
+#     class LoopState(eqx.Module):
+#         key: chex.PRNGKey
+#         q_network: QNetwork
+#         done: bool
+#         obs: chex.Array
+#         state: Any
+#         z_w: Any
+#         reward_: float
+#         reward_trace: float
+#         obs_stats: SampleMeanStats
+#         reward_stats: SampleMeanStats
+#         length: int
+#         global_timestep: int
+
+#     def while_loop_body(carry: LoopState):
+#         # extract carry elements
+#         key = carry.key
+#         obs, state = carry.obs, carry.state
+#         q_network, z_w = carry.q_network, carry.z_w
+#         obs_stats = carry.obs_stats
+#         reward_stats = carry.reward_stats
+#         reward_trace = carry.reward_trace
+#         global_timestep = carry.global_timestep + 1
+
+#         key, action_key = jax_random.split(key)
+
+#         # Select an action using epsilon-greedy policy.
+#         eps = linear_epsilon_schedule(start_e, end_e, stop_exploring_timestep, global_timestep)
+#         action, q_value, explored = q_epsilon_greedy(q_network, obs, eps, action_key)
+
+#         # Step the environment.
+#         key, step_key = jax_random.split(key)
+#         next_obs, next_state, reward, done, _ = env.step(step_key, state, action, env_params)
+
+#         # normalize observation & reward
+#         next_obs, obs_stats = normalize_observation(next_obs, obs_stats)
+#         scaled_reward, reward_trace, reward_stats = scale_reward(reward, reward_stats, reward_trace, done, gamma)
+
+#         # Update eligibility trace
+#         td_error, td_grad = value_and_grad(get_delta)(q_network, scaled_reward, gamma, done, obs, action, next_obs)
+#         z_w = update_eligibility_trace(z_w, gamma, lambda_, td_grad)
+
+#         # Update Q-network using ObGD
+#         q_network = ObGD(z_w, q_network, td_error, alpha, kappa)
+
+#         # reset eligibility trace if an exploration occurred
+#         z_w = jt.map(lambda old: jax_lax.select(
+#                 jnp.logical_or(explored, done),
+#                 jnp.zeros_like(old),
+#                 old
+#             ), z_w
+#         )
+
+
+#         return LoopState(
+#             key=key,
+#             done=done,
+#             obs=next_obs,
+#             state=next_state,
+#             z_w=z_w,
+#             q_network=q_network,
+#             reward_=carry.reward_ * gamma + reward,
+#             reward_trace=reward_trace,
+#             global_timestep=global_timestep,
+#             length=carry.length + 1,
+#             obs_stats=obs_stats,
+#             reward_stats=reward_stats,
+#         )
+
+#     @eqx.filter_jit
+#     def jitted_while_loop(episode_state: LoopState):
+#         return jax_lax.while_loop(
+#             lambda carry: jnp.logical_not(carry.done),
+#             while_loop_body,
+#             episode_state
+#         )
+
+#     def non_jitted_while_loop(episode_state: LoopState):
+#         while not episode_state.done:
+#             episode_state = while_loop_body(episode_state)
+#         return episode_state
+
+#     i = 0
+#     current_timestep = 0
+#     key, reset_key = jax_random.split(key)
+#     obs, state = env.reset(key, env_params)
+#     obs_stats = SampleMeanStats.new_params(obs.shape)
+#     obs, obs_stats = normalize_observation(obs, obs_stats)
+#     reward_stats = SampleMeanStats.new_params(())
+#     while current_timestep < total_timesteps:
+#         initial_loop_state = LoopState(
+#             key=key,
+#             done=False,
+#             obs=obs,
+#             state=state,
+#             z_w=init_eligibility_trace(q_network),
+#             q_network=q_network,
+#             reward_=0.0,
+#             reward_trace=0.0,
+#             global_timestep=current_timestep,
+#             length=0.0,
+#             obs_stats=obs_stats,
+#             reward_stats=reward_stats,
+#         )
+
+#         # episode_result = non_jitted_while_loop(initial_loop_state)
+#         episode_result = jitted_while_loop(initial_loop_state)
+
+#         # extract relevant info from environment, like PRNG key
+#         key = episode_result.key
+#         q_network = episode_result.q_network
+#         current_timestep += episode_result.length
+#         obs_stats = episode_result.obs_stats
+#         reward_stats = episode_result.reward_stats
+
+#         # reset environment
+#         key, reset_key = jax_random.split(key)
+#         obs, state = env.reset(reset_key, env_params)
+#         obs, obs_stats = normalize_observation(obs, obs_stats)
+
+#         epsilon = linear_epsilon_schedule(start_e, end_e, stop_exploring_timestep, current_timestep)
+#         print(f"Ep: {i}. Episodic Return: {episode_result.reward_:.1f}. Percent elapsed: {100 * current_timestep / total_timesteps:2.2f}%. Epsilon: {epsilon:.2f}")
+
+#         i += 1
+
+#     return q_network
