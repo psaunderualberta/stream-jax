@@ -11,7 +11,8 @@ from util import (
     scale_reward,
     linear_epsilon_schedule,
     SampleMeanStats,
-    is_none
+    is_none,
+    pytree_if_else,
 )
 from transition import Transition
 from gymnax.environments import environment, spaces
@@ -78,10 +79,12 @@ class StreamQTrainState:
         rng_ts: chex.PRNGKey,
     ) -> 'StreamQTrainState':
         """Create a new StreamQTrainState."""
-        z_w = init_eligibility_trace(q_network)
+        obs, obs_stats = normalize_observation(state_transition.obs, obs_stats)
+        state_transition = state_transition.replace(obs=obs)
+
         return cls(
             q_network=q_network,
-            z_w=z_w,
+            z_w=init_eligibility_trace(q_network),
             obs_stats=obs_stats,
             reward_stats=reward_stats,
             reward_trace=0.0,
@@ -101,12 +104,9 @@ class StreamQTrainState:
             env, env_params, reset_rng
         )
 
-        obs, obs_stats = normalize_observation(init_transition.obs, self.obs_stats)
-        init_transition = init_transition.replace(obs=obs)
-
         return StreamQTrainState.create(
             q_network=self.q_network,
-            obs_stats=obs_stats,
+            obs_stats=self.obs_stats,
             reward_stats=self.reward_stats,
             state_transition=init_transition,
             global_timestep=self.global_timestep,
@@ -122,7 +122,7 @@ class StreamQTrainState:
         )
 
     def normalize_transition(self, gamma: float) -> 'StreamQTrainState':
-        """Normalize the observation and reward in the transition."""
+        """Normalize the next observation and reward in the transition."""
         next_obs, obs_stats = normalize_observation(
             self.state_transition.next_obs, self.obs_stats
         )
@@ -136,7 +136,7 @@ class StreamQTrainState:
 
         new_transition = self.state_transition.replace(
             next_obs=next_obs,
-            reward=scaled_reward
+            reward=scaled_reward,
         )
 
         return StreamQTrainState(
@@ -214,35 +214,22 @@ class StreamQ:
 
             # reset eligibility trace if an exploration occurred
             done = next_ts.state_transition.done
-            z_w = jt.map(lambda old: jax_lax.select(
-                    jnp.logical_or(explored, done),
-                    jnp.zeros_like(old),
-                    old
-                ), z_w
-            )
+            z_w = pytree_if_else(explored, init_eligibility_trace(q_network), z_w)
 
-            # reset eligibility trace if an exploration occurred
+            # move to next training iteration
             rng, rng_reset = jax_random.split(rng)
             next_ts = next_ts.replace(
                 q_network=q_network,
                 z_w=z_w,
                 rng_ts=rng,
             ).next_iteration()
+
             reset_ts = next_ts.start_of_episode(
                 self.env, self.env_params, rng_reset
             )
 
             # If the episode is done, reset the state transition
-            return jt.map(
-                lambda rst, nxt: rst if rst is None else jax_lax.select(
-                    done,
-                    rst,
-                    nxt
-                ),
-                reset_ts,
-                next_ts,
-                is_leaf=is_none
-            )
+            return pytree_if_else(done, reset_ts, next_ts, is_leaf=is_none)
 
         @eqx.filter_jit
         def eval_iteration(ts: StreamQTrainState):
@@ -294,6 +281,8 @@ if __name__ == "__main__":
     def eval_callback(algo: StreamQ, ts: StreamQTrainState, rng: chex.PRNGKey):
         q = ts.q_network
         state = ts.state_transition.initial_transition(algo.env, algo.env_params, rng)
+        obs, _ = normalize_observation(state.obs, ts.obs_stats)
+        state = state.replace(obs=obs)
 
         def loop_body(transition: Transition):
             action = jnp.argmax(q(transition.obs), axis=-1)
@@ -325,7 +314,6 @@ if __name__ == "__main__":
         )
         return trans.reward
 
-            
 
     # Run the stream Q-learning algorithm
     q_network = StreamQ(
@@ -338,8 +326,8 @@ if __name__ == "__main__":
         kappa=2.0,
         start_e=1.0,
         end_e=0.01,
-        stop_exploring_timestep=250_000,
-        total_timesteps=500_000,
+        stop_exploring_timestep=25_000,
+        total_timesteps=50_000,
         eval_freq=1000,
         eval_callback=eval_callback
     ).train(key_act)

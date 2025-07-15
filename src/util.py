@@ -148,6 +148,20 @@ def update_eligibility_trace(
     return jtu.tree_map(update_trace, z_w, new_term)
 
 
+def pytree_if_else(
+    pred,
+    pt1,
+    pt2,
+    is_leaf=is_none
+):
+    def body(l, r):
+        if l is None:
+            return l
+        return jax_lax.select(pred, l, r)
+    
+    return jtu.tree_map(body, pt1, pt2, is_leaf=is_leaf)
+
+
 @eqx.filter_jit
 def init_eligibility_trace(
     model: eqx.Module
