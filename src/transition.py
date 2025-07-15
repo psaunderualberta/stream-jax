@@ -45,7 +45,7 @@ class Transition(eqx.Module):
             is_leaf=is_none,
         )
 
-    def populate_transition(
+    def take_action(
         self,
         env: environment.Environment,
         env_params: environment.EnvParams,
