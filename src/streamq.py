@@ -152,7 +152,7 @@ class StreamQTrainState:
     
     def new_transition(self, env, env_params, action: chex.Array, rng: chex.PRNGKey) -> 'StreamQTrainState':
         """Create a new transition object based on the current state."""
-        next_transition = self.state_transition.population_transition(env, env_params, action, rng)
+        next_transition = self.state_transition.populate_transition(env, env_params, action, rng)
         return self.replace(state_transition=next_transition)
 
 
@@ -443,6 +443,42 @@ if __name__ == "__main__":
     hidden_layer_sizes = [64, 64]  # Example hidden layer sizes
     q_network = QNetwork(obs_shape, hidden_layer_sizes, num_actions, key_reset)
 
+    def eval_callback(algo: StreamQ, ts: StreamQTrainState, rng: chex.PRNGKey):
+        q = ts.q_network
+        state = ts.state_transition.initial_transition(algo.env, algo.env_params, rng)
+
+        def loop_body(transition: Transition):
+            action = jnp.argmax(q(transition.obs), axis=-1)
+            next_obs, next_state, reward, done, _ = algo.env.step(rng, transition.state, action, algo.env_params)
+            next_obs, obs_stats = normalize_observation(next_obs, ts.obs_stats)
+
+            return Transition(
+                obs=next_obs,
+                state=next_state,
+                reward=transition.reward * algo.gamma + reward,
+                done=done,
+                has_next_state=False
+            )
+
+        trans = jax_lax.while_loop(
+            lambda t: jnp.logical_not(t.done),
+            loop_body,
+            state
+        )
+
+        time_elapsed = ts.global_timestep / algo.total_timesteps * 100
+        jax.debug.print(
+            "Episodic Return: {:.1f}. Percent elapsed: {:2.2f}%. Epsilon: {:.2f}",
+            trans.reward,
+            time_elapsed,
+            linear_epsilon_schedule(
+                algo.start_e, algo.end_e, algo.stop_exploring_timestep, ts.global_timestep
+            )
+        )
+        return trans.reward
+
+            
+
     # Run the stream Q-learning algorithm
     q_network = StreamQ(
         q_network,
@@ -453,7 +489,8 @@ if __name__ == "__main__":
         alpha=1.0,
         kappa=2.0,
         start_e=1.0,
-        end_e=0.2,
-        stop_exploring_timestep=25_000,
-        total_timesteps=50_000,
+        end_e=0.01,
+        stop_exploring_timestep=250_000,
+        total_timesteps=500_000,
+        eval_callback=eval_callback
     ).train(key_act)

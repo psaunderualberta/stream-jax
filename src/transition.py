@@ -43,7 +43,7 @@ class Transition(eqx.Module):
             tuple(v for _, v in els)
         )
 
-    def population_transition(
+    def populate_transition(
         self,
         env: environment.Environment,
         env_params: environment.EnvParams,
