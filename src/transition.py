@@ -1,6 +1,7 @@
 from gymnax.environments import EnvState, EnvState, environment
 import chex
 import equinox as eqx
+from util import is_none
 
 class Transition(eqx.Module):
     obs: chex.Array
@@ -40,7 +41,8 @@ class Transition(eqx.Module):
         return eqx.tree_at(
             lambda t: tuple(getattr(t, k) for k, _ in els),
             self,
-            tuple(v for _, v in els)
+            tuple(v for _, v in els),
+            is_leaf=is_none,
         )
 
     def populate_transition(

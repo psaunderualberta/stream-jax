@@ -192,7 +192,6 @@ class StreamQ:
         pass
     
     def train(self, rng: chex.PRNGKey) -> StreamQTrainState:
-        @eqx.filter_jit
         def train_iteration(ts: StreamQTrainState):
             rng, rng_action = jax_random.split(ts.rng_ts)
 
@@ -214,24 +213,29 @@ class StreamQ:
             q_network = ObGD(ts.z_w, ts.q_network, td_error, self.alpha, self.kappa)
 
             # reset eligibility trace if an exploration occurred
-            next_ts = next_ts.replace(
-                q_network=q_network,
-                z_w=z_w,
-            ).next_iteration()
+            done = next_ts.state_transition.done
+            z_w = jt.map(lambda old: jax_lax.select(
+                    jnp.logical_or(explored, done),
+                    jnp.zeros_like(old),
+                    old
+                ), z_w
+            )
 
             # reset eligibility trace if an exploration occurred
             rng, rng_reset = jax_random.split(rng)
+            next_ts = next_ts.replace(
+                q_network=q_network,
+                z_w=z_w,
+                rng_ts=rng,
+            ).next_iteration()
             reset_ts = next_ts.start_of_episode(
                 self.env, self.env_params, rng_reset
             )
 
-            # If the episode is done or an exploration occurred, reset the state transition
-            should_reset = jnp.logical_or(
-                explored, next_ts.state_transition.done
-            ).squeeze()
+            # If the episode is done, reset the state transition
             return jt.map(
                 lambda rst, nxt: rst if rst is None else jax_lax.select(
-                    should_reset,
+                    done,
                     rst,
                     nxt
                 ),
@@ -242,7 +246,6 @@ class StreamQ:
 
         @eqx.filter_jit
         def eval_iteration(ts: StreamQTrainState):
-            # Optionally visualize or log the training progress
             eval_result = jax_lax.fori_loop(
                 0,
                 self.eval_freq,
@@ -271,7 +274,7 @@ class StreamQ:
             length=self.total_timesteps // self.eval_freq
         )
 
-        return train_result
+        return train_result, evaluations
 
 if __name__ == "__main__":
     # Example usage
@@ -285,7 +288,7 @@ if __name__ == "__main__":
 
     obs_shape = env.observation_space(env_params).shape[0]
     num_actions = env.action_space(env_params).n
-    hidden_layer_sizes = [64, 64]  # Example hidden layer sizes
+    hidden_layer_sizes = [32, 32]  # Example hidden layer sizes
     q_network = QNetwork(obs_shape, hidden_layer_sizes, num_actions, key_reset)
 
     def eval_callback(algo: StreamQ, ts: StreamQTrainState, rng: chex.PRNGKey):
@@ -295,7 +298,7 @@ if __name__ == "__main__":
         def loop_body(transition: Transition):
             action = jnp.argmax(q(transition.obs), axis=-1)
             next_obs, next_state, reward, done, _ = algo.env.step(rng, transition.state, action, algo.env_params)
-            next_obs, obs_stats = normalize_observation(next_obs, ts.obs_stats)
+            next_obs, _ = normalize_observation(next_obs, ts.obs_stats)
 
             return Transition(
                 obs=next_obs,
@@ -315,7 +318,7 @@ if __name__ == "__main__":
         jax.debug.print(
             "Episodic Return: {:.1f}. Percent elapsed: {:2.2f}%. Epsilon: {:.2f}",
             trans.reward,
-            ts.obs_stats.count,
+            time_elapsed,
             linear_epsilon_schedule(
                 algo.start_e, algo.end_e, algo.stop_exploring_timestep, ts.global_timestep
             )
@@ -337,6 +340,7 @@ if __name__ == "__main__":
         end_e=0.01,
         stop_exploring_timestep=250_000,
         total_timesteps=500_000,
+        eval_freq=1000,
         eval_callback=eval_callback
     ).train(key_act)
 
