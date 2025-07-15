@@ -6,6 +6,8 @@ import equinox as eqx
 
 import chex
 from typing import Union
+from gymnax.environments import EnvState
+from flax import struct
 
 __eps = 1e-5
 

@@ -11,71 +11,28 @@ from util import (
     scale_reward,
     linear_epsilon_schedule,
     SampleMeanStats,
+    is_none
 )
+from transition import Transition
 from gymnax.environments import environment, spaces
 from gymnax import make
 from typing import Any
 from visualizer import visualize
 from simple_env import RightIsGoodState, RightIsGoodParams, RightIsGoodEnv
+from qnet import QNetwork
+from flax import struct
 
 
 jax.config.update('jax_default_device', jax.devices('cpu')[0])
 
 
-class QNetwork(eqx.Module):
-    layers: list[chex.Array]
-    activation: eqx.Module
-
-    def __init__(
-            self,
-            obs_shape: int,
-            hidden_layer_sizes: list[int],
-            num_actions: int,
-            key: chex.PRNGKey,
-            activation: eqx.Module = LeakyReLU()
-        ):
-
-        self.activation = activation
-
-        self.layers = []
-        self.activation = activation
-        in_size = obs_shape
-        for size in hidden_layer_sizes:
-            # Add a linear layer
-            key, _key = jax_random.split(key)
-            layer = Linear(in_size, size, key=_key)
-            self.layers.append(layer)
-
-            # # Add layer norm
-            layer_norm = eqx.nn.LayerNorm(size, use_weight=False, use_bias=False)
-            self.layers.append(layer_norm)
-
-            # # Add activation function
-            self.layers.append(activation)
-            in_size = size
-
-        # Final output layer
-        key, _key = jax_random.split(key)
-        output_layer = Linear(in_size, num_actions, key=_key)
-        self.layers.append(output_layer)
-
-    @jit
-    def __call__(self, x):
-        for layer in self.layers:
-            x = layer(x)
-        return x
-    
-    def num_actions(self):
-        return self.layers[-1].weight.shape[0]
-
-
 @jit
-def get_delta(q_network, reward, gamma, done, s, a, sp):
-    q_sp = q_network(sp).max()
-    q_sa = q_network(s)[a]
+def get_delta(q_network, transition: Transition, gamma: float):
+    q_sp = q_network(transition.next_obs).max()
+    q_sa = q_network(transition.obs)[transition.action]
     return (
-        reward
-        + (1 - done) * jax_lax.stop_gradient(gamma * q_sp)
+        transition.reward
+        + (1 - transition.done) * jax_lax.stop_gradient(gamma * q_sp)
         - q_sa
     )
 
@@ -98,6 +55,236 @@ def q_epsilon_greedy(q_network, state, epsilon: float, key: chex.PRNGKey):
     explored = action != greedy_action
     return action, q_value, explored
 
+
+@struct.dataclass
+class StreamQTrainState:
+    q_network: QNetwork
+    z_w: Any
+    obs_stats: SampleMeanStats
+    reward_stats: SampleMeanStats
+    reward_trace: float
+    state_transition: Transition
+    global_timestep: int
+    rng_ts: chex.PRNGKey
+
+    @classmethod
+    def create(
+        cls,
+        q_network: QNetwork,
+        obs_stats: SampleMeanStats,
+        reward_stats: SampleMeanStats,
+        state_transition: Transition,
+        global_timestep: int,
+        rng_ts: chex.PRNGKey,
+    ) -> 'StreamQTrainState':
+        """Create a new StreamQTrainState."""
+        z_w = init_eligibility_trace(q_network)
+        return cls(
+            q_network=q_network,
+            z_w=z_w,
+            obs_stats=obs_stats,
+            reward_stats=reward_stats,
+            reward_trace=0.0,
+            state_transition=state_transition,
+            global_timestep=global_timestep,
+            rng_ts=rng_ts
+        )
+
+    def start_of_episode(
+        self,
+        env: environment.Environment,
+        env_params: environment.EnvParams,
+        reset_rng: chex.PRNGKey
+    ) -> 'StreamQTrainState':
+        
+        init_transition = Transition.initial_transition(
+            env, env_params, reset_rng
+        )
+
+        obs, obs_stats = normalize_observation(init_transition.obs, self.obs_stats)
+        init_transition = init_transition.replace(obs=obs)
+
+        return StreamQTrainState.create(
+            q_network=self.q_network,
+            obs_stats=obs_stats,
+            reward_stats=self.reward_stats,
+            state_transition=init_transition,
+            global_timestep=self.global_timestep,
+            rng_ts=self.rng_ts
+        )
+
+    def next_iteration(self) -> 'StreamQTrainState':
+        """Prepare the state for the next iteration."""
+        return self.replace(
+            global_timestep=self.global_timestep + 1,
+            rng_ts=jax_random.split(self.rng_ts)[1],
+            state_transition=self.state_transition.step_transition()
+        )
+
+    def normalize_transition(self, gamma: float) -> 'StreamQTrainState':
+        """Normalize the observation and reward in the transition."""
+        next_obs, obs_stats = normalize_observation(
+            self.state_transition.next_obs, self.obs_stats
+        )
+        scaled_reward, reward_trace, reward_stats = scale_reward(
+            self.state_transition.reward,
+            self.reward_stats,
+            self.reward_trace,
+            self.state_transition.done,
+            gamma
+        )
+
+        new_transition = self.state_transition.replace(
+            next_obs=next_obs,
+            reward=scaled_reward
+        )
+
+        return StreamQTrainState(
+            q_network=self.q_network,
+            z_w=self.z_w,
+            obs_stats=obs_stats,
+            reward_stats=reward_stats,
+            reward_trace=reward_trace,
+            state_transition=new_transition,
+            global_timestep=self.global_timestep,
+            rng_ts=self.rng_ts
+        )
+    
+    def new_transition(self, env, env_params, action: chex.Array, rng: chex.PRNGKey) -> 'StreamQTrainState':
+        """Create a new transition object based on the current state."""
+        next_transition = self.state_transition.population_transition(env, env_params, action, rng)
+        return self.replace(state_transition=next_transition)
+
+
+@struct.dataclass
+class StreamQ:
+    q_network: QNetwork = struct.field(pytree_node=False)
+    env: environment.Environment = struct.field(pytree_node=False)
+    env_params: environment.EnvParams = struct.field(pytree_node=False)
+    gamma: float = struct.field(pytree_node=False)
+    lambda_: float = struct.field(pytree_node=False)
+    alpha: float = struct.field(pytree_node=False)
+    kappa: float = struct.field(pytree_node=False)
+    start_e: float = struct.field(pytree_node=False)
+    end_e: float = struct.field(pytree_node=False)
+    stop_exploring_timestep: float = struct.field(pytree_node=False)
+    total_timesteps: int = struct.field(pytree_node=False)
+    eval_freq: int = struct.field(pytree_node=False, default=5000)
+    eval_callback: Any = struct.field(pytree_node=False, default=lambda *args: None)
+
+    @classmethod
+    def create(cls, **kwargs) -> "StreamQ":
+        return cls(
+            q_network=kwargs['q_network'],
+            env=kwargs['env'],
+            env_params=kwargs['env_params'],
+            gamma=kwargs['gamma'],
+            lambda_=kwargs['lambda_'],
+            alpha=kwargs['alpha'],
+            kappa=kwargs['kappa'],
+            start_e=kwargs['start_e'],
+            end_e=kwargs['end_e'],
+            stop_exploring_timestep=kwargs['stop_exploring_timestep'],
+            total_timesteps=kwargs['total_timesteps'],
+        )
+    
+    def make_act(self, train_state: StreamQTrainState, rng: chex.PRNGKey) -> Any:
+        pass
+    
+    def train(self, rng: chex.PRNGKey) -> StreamQTrainState:
+        @eqx.filter_jit
+        def train_iteration(ts: StreamQTrainState):
+            rng, rng_action = jax_random.split(ts.rng_ts)
+
+            # Select an action using epsilon-greedy policy.
+            eps = linear_epsilon_schedule(self.start_e, self.end_e, self.stop_exploring_timestep, ts.global_timestep)
+            action, q_value, explored = q_epsilon_greedy(ts.q_network, ts.state_transition.obs, eps, rng_action)
+
+            # Step the environment, normalize observation & reward
+            rng, rng_step = jax_random.split(rng)
+            next_ts = ts.new_transition(
+                self.env, self.env_params, action, rng_step
+            ).normalize_transition(self.gamma)
+
+            # Update eligibility trace
+            td_error, td_grad = value_and_grad(get_delta)(ts.q_network, next_ts.state_transition, self.gamma)
+            z_w = update_eligibility_trace(ts.z_w, self.gamma, self.lambda_, td_grad)
+
+            # Update Q-network using ObGD
+            q_network = ObGD(ts.z_w, ts.q_network, td_error, self.alpha, self.kappa)
+
+            # reset eligibility trace if an exploration occurred
+            next_ts = next_ts.replace(
+                q_network=q_network,
+                z_w=z_w,
+            ).next_iteration()
+
+            # reset eligibility trace if an exploration occurred
+            rng, rng_reset = jax_random.split(rng)
+            reset_ts = next_ts.start_of_episode(
+                self.env, self.env_params, rng_reset
+            )
+
+            # If the episode is done or an exploration occurred, reset the state transition
+            should_reset = jnp.logical_or(
+                explored, next_ts.state_transition.done
+            ).squeeze()
+            return jt.map(
+                lambda rst, nxt: rst if rst is None else jax_lax.select(
+                    should_reset,
+                    rst,
+                    nxt
+                ),
+                reset_ts,
+                next_ts,
+                is_leaf=is_none
+            )
+
+        @eqx.filter_jit
+        def eval_iteration(ts: StreamQTrainState):
+            # Optionally visualize or log the training progress
+            eval_result = jax_lax.fori_loop(
+                0,
+                self.eval_freq,
+                lambda _, ts: train_iteration(ts),
+                ts,
+            )
+
+            return eval_result, self.eval_callback(self, eval_result, ts.rng_ts)
+
+        rng, rng_reset, rng_ts = jax_random.split(rng, 3)
+        obs_shape = env.observation_space(self.env_params).shape
+        train_state = StreamQTrainState.create(
+            q_network=self.q_network,
+            obs_stats=SampleMeanStats.new_params(obs_shape),
+            reward_stats=SampleMeanStats.new_params(()),
+            state_transition=Transition.initial_transition(
+                env, env_params, rng_reset
+            ),
+            global_timestep=0,
+            rng_ts=rng_ts
+        )
+        train_result, evaluations = jax_lax.scan(
+            lambda ts, _: eval_iteration(ts),
+            train_state,
+            None,
+            length=self.total_timesteps // self.eval_freq
+        )
+
+            # # Reset environment if done
+            # if train_state.state_transition.done:
+            #     rng, rng_reset = jax_random.split(train_state.rng_ts)
+            #     obs, state = self.env.reset(rng_reset, self.env_params)
+            #     train_state = train_state.replace(
+            #         obs=obs,
+            #         state=state,
+            #         state_transition=train_state.state_transition.replace(obs=obs, state=state)
+            #     )
+
+            # # Optionally visualize or log the training progress
+            # if train_state.global_timestep % self.eval_freq == 0:
+
+        return train_result
 
 def stream_q(
     q_network: QNetwork,
@@ -248,8 +435,8 @@ if __name__ == "__main__":
     key, key_reset, key_act, key_step = jax_random.split(key, 4)
 
     # Instantiate the environment & its settings.
-    env, env_params = make("MountainCar-v0")
-    env_params = env_params.replace(max_steps_in_episode=10_000)
+    env, env_params = make("CartPole-v1")
+    # env_params = env_params.replace(max_steps_in_episode=10_000)
 
     obs_shape = env.observation_space(env_params).shape[0]
     num_actions = env.action_space(env_params).n
@@ -257,7 +444,7 @@ if __name__ == "__main__":
     q_network = QNetwork(obs_shape, hidden_layer_sizes, num_actions, key_reset)
 
     # Run the stream Q-learning algorithm
-    q_network = stream_q(
+    q_network = StreamQ(
         q_network,
         env,
         env_params,
@@ -267,7 +454,6 @@ if __name__ == "__main__":
         kappa=2.0,
         start_e=1.0,
         end_e=0.2,
-        stop_exploring_timestep=2_000_000,
-        total_timesteps=4_000_000,
-        key=key_act
-    )
+        stop_exploring_timestep=25_000,
+        total_timesteps=50_000,
+    ).train(key_act)
