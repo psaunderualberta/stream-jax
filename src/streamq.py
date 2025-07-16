@@ -22,6 +22,7 @@ from visualizer import visualize
 from simple_env import RightIsGoodState, RightIsGoodParams, RightIsGoodEnv
 from qnet import QNetwork
 from flax import struct
+from typing import Callable
 
 
 jax.config.update('jax_default_device', jax.devices('cpu')[0])
@@ -71,17 +72,17 @@ class StreamQTrainState(eqx.Module):
     reward_stats: SampleMeanStats
     length: int
 
-    def replace(self, **kwargs) -> 'Transition':
-        """Replace attributes in the transition with new values."""
+    def replace(self, **kwargs) -> 'StreamQTrainState':
+        """Replace attributes in the training state with new values, akin to flax's 'dataclass.replace'"""
 
         els = list(kwargs.items())
-
         return eqx.tree_at(
             lambda t: tuple(getattr(t, k) for k, _ in els),
             self,
             tuple(v for _, v in els),
             is_leaf=is_none,
         )
+
 
 @struct.dataclass
 class StreamQ:
@@ -115,10 +116,13 @@ class StreamQ:
             total_timesteps=kwargs['total_timesteps'],
         )
     
-    def make_act(self, train_state: StreamQTrainState, rng: chex.PRNGKey) -> Any:
-        pass
+    def make_act(self, train_state: StreamQTrainState) -> Callable[[chex.Array, chex.PRNGKey], int | float | chex.Array]:
+        def act(obs: chex.Array, _: chex.PRNGKey):
+            return jnp.argmax(train_state.q_network(obs), axis=-1)
     
-    def train(self, rng: chex.PRNGKey) -> StreamQTrainState:
+        return act
+    
+    def train(self, key: chex.PRNGKey) -> StreamQTrainState:
         def train_iteration(ts: StreamQTrainState):
             # extract carry elements
             key = ts.key
@@ -203,13 +207,13 @@ class StreamQ:
 
             return eval_result, self.eval_callback(self, eval_result, ts.key)
 
-        rng, rng_reset, rng_ts = jax_random.split(rng, 3)
+        key, key_reset, key_ts = jax_random.split(key, 3)
         obs, state = env.reset(key, env_params)
         obs_stats = SampleMeanStats.new_params(obs.shape)
         obs, obs_stats = normalize_observation(obs, obs_stats)
         reward_stats = SampleMeanStats.new_params(())
         train_state = StreamQTrainState(
-            key=rng_ts,
+            key=key_ts,
             done=False,
             obs=obs,
             state=state,
@@ -246,17 +250,18 @@ if __name__ == "__main__":
     hidden_layer_sizes = [32, 32]  # Example hidden layer sizes
     q_network = QNetwork(obs_shape, hidden_layer_sizes, num_actions, key_reset)
 
-    def eval_callback(algo: StreamQ, ts: StreamQTrainState, rng: chex.PRNGKey):
+    def eval_callback(algo: StreamQ, ts: StreamQTrainState, key: chex.PRNGKey):
         q = ts.q_network
-        rng, rng_reset = jax_random.split(rng)
-        transition = Transition.initial_transition(env, env_params, rng_reset)
+        act = algo.make_act(ts)
+        key, key_reset = jax_random.split(key)
+        transition = Transition.initial_transition(env, env_params, key_reset)
         transition = transition.replace(
             obs=normalize_observation(transition.obs, ts.obs_stats)[0]
         )
 
         def loop_body(transition: Transition):
-            action = jnp.argmax(q(transition.obs), axis=-1)
-            next_obs, next_state, reward, done, _ = algo.env.step(rng, transition.state, action, algo.env_params)
+            action = act(transition.obs, key)
+            next_obs, next_state, reward, done, _ = algo.env.step(key, transition.state, action, algo.env_params)
             next_obs, _ = normalize_observation(next_obs, ts.obs_stats)
 
             return Transition(

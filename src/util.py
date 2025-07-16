@@ -122,13 +122,13 @@ def sparse_init_linear(in_size, out_size, sparsity_level, key):
     zeros_per_col = jnp.ceil(sparsity_level * in_size).astype(int)
 
     # Initialize weights with lecun initialization + sparsity
-    weights = jr.uniform(key, layer_size, get_float_dtype(), minval=-init_bound, maxval=init_bound)
+    key, key_ = jr.split(key)
+    weights = jr.uniform(key_, layer_size, get_float_dtype(), minval=-init_bound, maxval=init_bound)
 
     # init same as source code
-    for col_idx in range(out_size):
-        key, _key = jr.split(key)
-        zero_idxs = jr.permutation(_key, in_size)[:zeros_per_col]
-        weights = weights.at[col_idx, zero_idxs].set(0.0)
+    key, key_ = jr.split(key)
+    zeros = jr.bernoulli(key_, 1 - sparsity_level, weights.shape)
+    weights = weights * zeros
 
     # Initialize bias
     bias = jnp.zeros((out_size,), dtype=get_float_dtype())
