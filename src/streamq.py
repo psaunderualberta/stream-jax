@@ -177,16 +177,10 @@ class StreamQ:
                 reward_stats=reward_stats,
             )
             
-            # if the episode terminated, we need to reset obs, state, reward_trace, z_w, reward_, length
-            key, reset_key = jax_random.split(key)
-            reset_obs, reset_state = self.env.reset(key, self.env_params)
-            reset_obs, reset_obs_stats = normalize_observation(reset_obs, next_ts.obs_stats)
-
+            # If the episode terminated, we need to reset reward_trace, reward_, & length.
+            # IMPORTANT: This is because gymnax has auto-reset, i.e. if env.step returns True,
+            # then obs & state represent the reset environment's observation & state
             reset_ts = next_ts.replace(
-                obs=reset_obs,
-                state=reset_state,
-                obs_stats=reset_obs_stats,
-                key=reset_key,
                 reward_trace=0.0,
                 reward_=0.0,
                 length=0
@@ -247,7 +241,7 @@ if __name__ == "__main__":
 
     obs_shape = env.observation_space(env_params).shape[0]
     num_actions = env.action_space(env_params).n
-    hidden_layer_sizes = [32, 32]  # Example hidden layer sizes
+    hidden_layer_sizes = [64, 64]  # Example hidden layer sizes
     q_network = QNetwork(obs_shape, hidden_layer_sizes, num_actions, key_reset)
 
     def eval_callback(algo: StreamQ, ts: StreamQTrainState, key: chex.PRNGKey):
@@ -301,8 +295,8 @@ if __name__ == "__main__":
         kappa=2.0,
         start_e=1.0,
         end_e=0.01,
-        stop_exploring_timestep=250_000,
-        total_timesteps=500_000,
+        stop_exploring_timestep=50_000,
+        total_timesteps=100_000,
         eval_freq=1000,
         eval_callback=eval_callback
     ).train(key_act)
