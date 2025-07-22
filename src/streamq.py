@@ -1,5 +1,5 @@
 import equinox as eqx
-from jax import numpy as jnp, random as jax_random, tree as jt, jit, lax as jax_lax, value_and_grad, jax
+from jax import numpy as jnp, random as jax_random, tree as jt, jit, lax as jax_lax, value_and_grad, grad, jax
 import chex
 from util import (
     LeakyReLU,
@@ -13,6 +13,7 @@ from util import (
     SampleMeanStats,
     is_none,
     pytree_if_else,
+    divide_pytree
 )
 from transition import Transition
 from gymnax.environments import environment, spaces
@@ -23,6 +24,7 @@ from simple_env import RightIsGoodState, RightIsGoodParams, RightIsGoodEnv
 from qnet import QNetwork
 from flax import struct
 from typing import Callable
+import optax
 
 
 jax.config.update('jax_default_device', jax.devices('cpu')[0])
@@ -36,6 +38,15 @@ def get_delta(q_network, scaled_reward, gamma, done, obs, action, next_obs):
         scaled_reward
         + (1 - done) * jax_lax.stop_gradient(gamma * q_sp)
         - q_sa
+    )
+
+@jit
+def huber_loss_delta(q_network, scaled_reward, gamma, done, obs, action, next_obs):
+    delta = get_delta(q_network, scaled_reward, gamma, done, obs, action, next_obs)
+    return jax_lax.select(
+        jnp.abs(delta) <= 1,
+        1/2 * delta ** 2,
+        jnp.abs(delta) - 1/2
     )
 
 
@@ -63,14 +74,16 @@ class StreamQTrainState(eqx.Module):
     done: bool
     obs: chex.PRNGKey
     state: environment.EnvState
-    z_w: QNetwork
     q_network: QNetwork
+    sum_td_grad: QNetwork = struct.field(pytree_node=False)
     reward_: float
     reward_trace: float
     global_timestep: int
     obs_stats: SampleMeanStats
     reward_stats: SampleMeanStats
     length: int
+    total_loss: float
+    episode_num: int = 0
 
     def replace(self, **kwargs) -> 'StreamQTrainState':
         """Replace attributes in the training state with new values, akin to flax's 'dataclass.replace'"""
@@ -96,7 +109,7 @@ class StreamQ:
     start_e: float = struct.field(pytree_node=False)
     end_e: float = struct.field(pytree_node=False)
     stop_exploring_timestep: float = struct.field(pytree_node=False)
-    total_timesteps: int = struct.field(pytree_node=False)
+    num_episodes: int = struct.field(pytree_node=False)
     eval_freq: int = struct.field(pytree_node=False, default=5000)
     eval_callback: Any = struct.field(pytree_node=False, default=lambda *_: None)
 
@@ -127,7 +140,7 @@ class StreamQ:
             # extract carry elements
             key = ts.key
             obs, state = ts.obs, ts.state
-            q_network, z_w = ts.q_network, ts.z_w
+            q_network = ts.q_network
             obs_stats = ts.obs_stats
             reward_stats = ts.reward_stats
             reward_trace = ts.reward_trace
@@ -148,26 +161,14 @@ class StreamQ:
             scaled_reward, reward_trace, reward_stats = scale_reward(reward, reward_stats, reward_trace, done, self.gamma)
 
             # Update eligibility trace
-            td_error, td_grad = value_and_grad(get_delta)(q_network, scaled_reward, self.gamma, done, obs, action, next_obs)
-            z_w = update_eligibility_trace(z_w, self.gamma, self.lambda_, td_grad)
-
-            # Update Q-network using ObGD
-            q_network = ObGD(z_w, q_network, td_error, self.alpha, self.kappa)
-
-            # reset eligibility trace if an exploration occurred
-            z_w = jt.map(lambda old: jax_lax.select(
-                    jnp.logical_or(explored, done),
-                    jnp.zeros_like(old),
-                    old
-                ), z_w
-            )
+            loss, huber_grad = value_and_grad(get_delta)(q_network, scaled_reward, self.gamma, done, obs, action, next_obs)
+            sum_td_grad = eqx.apply_updates(ts.sum_td_grad, huber_grad)
 
             next_ts = ts.replace(
                 key=key,
                 done=done,
                 obs=next_obs,
                 state=next_state,
-                z_w=z_w,
                 q_network=q_network,
                 reward_=ts.reward_ * self.gamma + reward,
                 reward_trace=reward_trace,
@@ -175,31 +176,36 @@ class StreamQ:
                 length=ts.length + 1,
                 obs_stats=obs_stats,
                 reward_stats=reward_stats,
-            )
-            
-            # If the episode terminated, we need to reset reward_trace, reward_, & length.
-            # IMPORTANT: This is because gymnax has auto-reset, i.e. if env.step returns True,
-            # then obs & state represent the reset environment's observation & state
-            reset_ts = next_ts.replace(
-                reward_trace=0.0,
-                reward_=0.0,
-                length=0
+                sum_td_grad=sum_td_grad,
+                total_loss=ts.total_loss + loss
             )
 
-            return pytree_if_else(done, reset_ts, next_ts)
-
-
+            return next_ts
 
         @eqx.filter_jit
         def eval_iteration(ts: StreamQTrainState):
-            eval_result = jax_lax.fori_loop(
-                0,
-                self.eval_freq,
-                lambda _, ts: train_iteration(ts),
+            eval_result = jax_lax.while_loop(
+                lambda ts: jnp.logical_not(ts.done),
+                train_iteration,
                 ts,
             )
 
-            return eval_result, self.eval_callback(self, eval_result, ts.key)
+            avg_grad = divide_pytree(eval_result.sum_td_grad, eval_result.length)
+            delta = eval_result.total_loss / eval_result.length
+            q_network = ObGD(avg_grad, eval_result.q_network, delta, self.alpha, self.kappa)
+
+            episode_result = eval_result.replace(
+                q_network=q_network,
+                sum_td_grad=init_eligibility_trace(q_network),
+                total_loss=0.0,
+                reward_=0.,
+                reward_trace=0.0,
+                length=0,
+                episode_num=eval_result.episode_num + 1,
+                done=False,
+            )
+
+            return episode_result, self.eval_callback(self, eval_result, ts.key)
 
         key, key_reset, key_ts = jax_random.split(key, 3)
         obs, state = env.reset(key, env_params)
@@ -211,7 +217,7 @@ class StreamQ:
             done=False,
             obs=obs,
             state=state,
-            z_w=init_eligibility_trace(q_network),
+            sum_td_grad=init_eligibility_trace(q_network),
             q_network=q_network,
             reward_=0.0,
             reward_trace=0.0,
@@ -219,12 +225,14 @@ class StreamQ:
             length=0,
             obs_stats=obs_stats,
             reward_stats=reward_stats,
+            total_loss=0.0,
         )
+
         train_result, evaluations = jax_lax.scan(
             lambda ts, _: eval_iteration(ts),
             train_state,
             None,
-            length=self.total_timesteps // self.eval_freq
+            length=self.num_episodes
         )
 
         return train_result, evaluations
@@ -237,7 +245,7 @@ if __name__ == "__main__":
 
     # Instantiate the environment & its settings.
     env, env_params = make("CartPole-v1")
-    # env_params = env_params.replace(max_steps_in_episode=10_000)
+    env_params = env_params.replace(max_steps_in_episode=1000)
 
     obs_shape = env.observation_space(env_params).shape[0]
     num_actions = env.action_space(env_params).n
@@ -272,11 +280,10 @@ if __name__ == "__main__":
             transition
         )
 
-        time_elapsed = ts.global_timestep / algo.total_timesteps * 100
         jax.debug.print(
-            "Episodic Return: {:.1f}. Percent elapsed: {:2.2f}%. Epsilon: {:.2f}",
+            "Episodic Return: {:.1f}. Training Steps: {:2}. Epsilon: {:.2f}",
             transition.reward,
-            time_elapsed,
+            ts.global_timestep,
             linear_epsilon_schedule(
                 algo.start_e, algo.end_e, algo.stop_exploring_timestep, ts.global_timestep
             )
@@ -285,7 +292,7 @@ if __name__ == "__main__":
 
 
     # Run the stream Q-learning algorithm
-    q_network = StreamQ(
+    result, evals = StreamQ(
         q_network,
         env,
         env_params,
@@ -296,7 +303,9 @@ if __name__ == "__main__":
         start_e=1.0,
         end_e=0.01,
         stop_exploring_timestep=50_000,
-        total_timesteps=100_000,
+        num_episodes=2000,
         eval_freq=1000,
         eval_callback=eval_callback
     ).train(key_act)
+
+    print(result.global_timestep)

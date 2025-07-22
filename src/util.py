@@ -148,6 +148,15 @@ def update_eligibility_trace(
     return jtu.tree_map(update_trace, z_w, new_term)
 
 
+def divide_pytree(tree, num):
+    def div(leaf):
+        if leaf is None:
+            return leaf
+        return leaf / num
+
+    return jtu.tree_map(div, tree, is_leaf=is_none)
+
+
 def pytree_if_else(
     pred,
     pt1,
