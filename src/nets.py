@@ -1,7 +1,7 @@
 import equinox as eqx
 import chex
 from util import LeakyReLU, Linear
-from jax import numpy as jnp, random as jax_random, jit
+from jax import random as jax_random, jit, numpy as jnp
 from jax.nn import softplus
 
 class QNetwork(eqx.Module):
@@ -98,6 +98,28 @@ class Actor(eqx.Module):
         pre_std = self.std_layer(x)
         std = softplus(pre_std)
         return mu, std
+    
+    @jit
+    def sample(self, x, key):
+        mu, std = self(x)
+        return jax_random.normal(key, (), dtype=x.dtype) * std + mu
+
+    @jit
+    def entropy(self, x):
+        _, std = self(x)
+        return 0.5 + 0.5 * jnp.log(2 * jnp.pi) + jnp.log(std)
+    
+    @jit
+    def log_prob(self, x, action):
+        mu, std = self(x)
+        var = std**2
+        log_scale = jnp.log(std)
+
+        return (
+            -((action - mu) ** 2) / (2 * var)
+            - log_scale
+            - jnp.log(jnp.sqrt(2 * jnp.pi))
+        )
 
 
 class Critic(eqx.Module):
@@ -132,7 +154,7 @@ class Critic(eqx.Module):
             in_size = size
 
         # Final output layer
-        key, _key = jax_random.split(key, 3)
+        key, _key = jax_random.split(key)
         self.layers.append(Linear(in_size, 1, key=_key))
 
     @jit
