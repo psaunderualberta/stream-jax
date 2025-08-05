@@ -13,7 +13,8 @@ from util import (
     SampleMeanStats,
     is_none,
     pytree_if_else,
-    divide_pytree
+    divide_pytree,
+    ObGD_update
 )
 from transition import Transition
 from gymnax.environments import environment, spaces
@@ -161,8 +162,10 @@ class StreamQ:
             scaled_reward, reward_trace, reward_stats = scale_reward(reward, reward_stats, reward_trace, done, self.gamma)
 
             # Update eligibility trace
-            loss, huber_grad = value_and_grad(get_delta)(q_network, scaled_reward, self.gamma, done, obs, action, next_obs)
-            sum_td_grad = eqx.apply_updates(ts.sum_td_grad, huber_grad)
+            delta, td_grad = value_and_grad(get_delta)(q_network, scaled_reward, self.gamma, done, obs, action, next_obs)
+
+            sum_td_grad = ObGD_update(td_grad, delta, self.alpha, self.kappa)
+            sum_td_grad = eqx.apply_updates(ts.sum_td_grad, td_grad)
 
             next_ts = ts.replace(
                 key=key,
@@ -177,7 +180,7 @@ class StreamQ:
                 obs_stats=obs_stats,
                 reward_stats=reward_stats,
                 sum_td_grad=sum_td_grad,
-                total_loss=ts.total_loss + loss
+                total_loss=ts.total_loss + delta
             )
 
             return next_ts
@@ -191,8 +194,7 @@ class StreamQ:
             )
 
             avg_grad = divide_pytree(eval_result.sum_td_grad, eval_result.length)
-            delta = eval_result.total_loss / eval_result.length
-            q_network = ObGD(avg_grad, eval_result.q_network, delta, self.alpha, self.kappa)
+            q_network = eqx.apply_updates(eval_result.q_network, avg_grad)
 
             episode_result = eval_result.replace(
                 q_network=q_network,
@@ -245,7 +247,7 @@ if __name__ == "__main__":
 
     # Instantiate the environment & its settings.
     env, env_params = make("CartPole-v1")
-    env_params = env_params.replace(max_steps_in_episode=1000)
+    # env_params = env_params.replace(max_steps_in_episode=1000)
 
     obs_shape = env.observation_space(env_params).shape[0]
     num_actions = env.action_space(env_params).n

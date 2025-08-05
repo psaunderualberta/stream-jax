@@ -23,9 +23,8 @@ def is_none(x):
 
 
 @eqx.filter_jit
-def ObGD(
+def ObGD_update(
     eligibility_trace: chex.Array,
-    model: chex.Array,
     delta: Union[float, chex.Array],
     alpha: Union[float, chex.Array],
     kappa: Union[float, chex.Array]
@@ -40,12 +39,24 @@ def ObGD(
     alpha_ = jnp.minimum(alpha / M, alpha)
 
     # update in direction of gradient
-    def _apply_update(m, e):
+    def _apply_update(e):
         if e is None:
-            return m
-        return m - alpha_ * delta * e
+            return e
+        return (-1) * alpha_ * delta * e
 
-    return jtu.tree_map(_apply_update, model, eligibility_trace)
+    return jtu.tree_map(_apply_update, eligibility_trace)
+
+
+@eqx.filter_jit
+def ObGD(
+    eligibility_trace: chex.Array,
+    model: chex.Array,
+    delta: Union[float, chex.Array],
+    alpha: Union[float, chex.Array],
+    kappa: Union[float, chex.Array]
+):
+    update = ObGD_update(eligibility_trace, delta, alpha, kappa)
+    return eqx.apply_updates(model, update)
 
 
 class SampleMeanStats(eqx.Module):
