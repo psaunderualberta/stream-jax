@@ -213,3 +213,34 @@ class Linear(eqx.Module):
 def linear_epsilon_schedule(start_e, end_e, duration, t):
     slope = (end_e - start_e) / duration
     return  jnp.maximum(slope * t + start_e, end_e)
+
+
+def eval_callback(algo, ts, key: chex.PRNGKey, gamma):
+    key, _key = jr.split(key)
+    act = algo.make_act(ts)
+    obs, state = algo.env.reset(_key, algo.env_params)
+    cum_reward = 0.0
+    carry = (obs, state, key, cum_reward, 0.0, False)
+
+    def body(carry):
+        obs, state, key, cum_reward, length, _ = carry
+        key, action_key, step_key = jr.split(key, 3)
+        action = act(obs, action_key)
+        next_obs, next_state, reward, done, _ = algo.env.step(step_key, state, action, algo.env_params)
+
+        return (
+            next_obs,
+            next_state,
+            key,
+            cum_reward + gamma**length * reward,
+            length + 1,
+            done
+        )
+    
+    (obs, state, key, cum_reward, length, done) = jax_lax.while_loop(
+        lambda c: jnp.logical_not(c[5]),
+        body,
+        carry
+    )
+
+    return cum_reward, length

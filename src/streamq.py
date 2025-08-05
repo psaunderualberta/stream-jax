@@ -1,7 +1,7 @@
 import equinox as eqx
-from jax import numpy as jnp, random as jax_random, tree as jt, jit, lax as jax_lax, value_and_grad, jax
+from jax import numpy as jnp, random as jax_random, tree as jt, jit, lax as jax_lax, value_and_grad, vmap, debug, jax
 import chex
-from streamq.util import (
+from util import (
     update_eligibility_trace,
     ObGD,
     init_eligibility_trace,
@@ -11,14 +11,17 @@ from streamq.util import (
     SampleMeanStats,
     is_none,
     pytree_if_else,
+    eval_callback,
 )
-from gymnax.environments import environment, spaces
+from gymnax.environments import environment
 from gymnax import make
 from typing import Any
-from streamq.qnet import QNetwork
+from nets import QNetwork
 from flax import struct
 from typing import Callable
-from util.util import evaluate
+
+
+jax.config.update('jax_default_device', jax.devices('cpu')[0])
 
 
 @jit
@@ -110,7 +113,8 @@ class StreamQ:
     
     def make_act(self, train_state: StreamQTrainState) -> Callable[[chex.Array, chex.PRNGKey], int | float | chex.Array]:
         def act(obs: chex.Array, _: chex.PRNGKey):
-            return jnp.argmax(train_state.q_network(obs), axis=-1)
+            norm_obs, _ = normalize_observation(obs, train_state.obs_stats)
+            return jnp.argmax(train_state.q_network(norm_obs), axis=-1)
     
         return act
 
@@ -240,34 +244,32 @@ if __name__ == "__main__":
     key, key_reset, key_act, key_step = jax_random.split(key, 4)
 
     # Instantiate the environment & its settings.
-    env, env_params = make("MountainCar-v0")
-    env_params = env_params.replace(max_steps_in_episode=10_000)
+    env, env_params = make("CartPole-v1")
+    # env_params = env_params.replace(max_steps_in_episode=10_000)
 
-    obs_shape = env.observation_space(env_params).shape[0]
-    num_actions = env.action_space(env_params).n
-    hidden_layer_sizes = [32, 32]  # Example hidden layer sizes
-    q_network = QNetwork(obs_shape, hidden_layer_sizes, num_actions, key_reset)
+    gamma = 0.99
+    def evaluate(algo, ts, key):
+        keys = jax_random.split(key, 3)
+        rewards, lengths = vmap(eval_callback, in_axes=(None, None, 0, None))(algo, ts, keys, gamma)
 
-    def eval_callback(algo: StreamQ, ts: StreamQTrainState, key: chex.PRNGKey):
-        act = algo.make_act(ts)
-        max_steps = algo.env_params.max_steps_in_episode
-        step = ts.global_step
+        debug.print("Global Step: {}, Avg. Reward: {:.2f}, Avg Length: {:.2f}",
+                    ts.global_step, jnp.mean(rewards), jnp.mean(lengths))
 
-        return ts.reward
+        return rewards, lengths
 
 
     # Run the stream Q-learning algorithm
     q_network = StreamQ(
         env,
         env_params,
-        gamma=0.99,
+        gamma=gamma,
         lambda_=0.8,
         alpha=1.0,
         kappa=2.0,
         start_e=1.0,
-        end_e=0.2,
-        stop_exploring_timestep=2_000_000,
-        total_timesteps=4_000_000,
-        eval_freq=1000,
-        eval_callback=eval_callback
+        end_e=0.01,
+        stop_exploring_timestep=50_000,
+        total_timesteps=100_000,
+        eval_freq=500,
+        eval_callback=evaluate
     ).train(key_act)
