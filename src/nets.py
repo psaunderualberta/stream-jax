@@ -1,7 +1,7 @@
 import equinox as eqx
 import chex
 from util import LeakyReLU, Linear
-from jax import random as jax_random, jit, numpy as jnp
+from jax import random as jax_random, jit, numpy as jnp, lax
 from jax.nn import softplus
 
 class QNetwork(eqx.Module):
@@ -96,7 +96,7 @@ class Actor(eqx.Module):
         
         mu = self.mu_layer(x)
         pre_std = self.std_layer(x)
-        std = softplus(pre_std)
+        std = lax.select(pre_std >= 20, pre_std, softplus(pre_std))
         return mu, std
     
     @jit

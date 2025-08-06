@@ -76,7 +76,8 @@ class StreamAC:
     gamma: float = struct.field(pytree_node=False)
     lambda_: float = struct.field(pytree_node=False)
     alpha: float = struct.field(pytree_node=False)
-    kappa: float = struct.field(pytree_node=False)
+    policy_kappa: float = struct.field(pytree_node=False)
+    value_kappa: float = struct.field(pytree_node=False)
     tau: float = struct.field(pytree_node=False)
     total_timesteps: int = struct.field(pytree_node=False)
     eval_freq: int = struct.field(pytree_node=False, default=5000)
@@ -91,7 +92,8 @@ class StreamAC:
             gamma=kwargs['gamma'],
             lambda_=kwargs['lambda_'],
             alpha=kwargs['alpha'],
-            kappa=kwargs['kappa'],
+            policy_alpha=kwargs['policy_alpha'],
+            value_kappa=kwargs['value_kappa'],
             tau=kwargs['tau'],
             total_timesteps=kwargs['total_timesteps'],
         )
@@ -142,8 +144,8 @@ class StreamAC:
             actor_z_w = update_eligibility_trace(actor_z_w, self.gamma, self.lambda_, actor_grad)
 
             # Update actor, critic params using ObGD
-            critic = ObGD(critic_z_w, critic, td_error, self.alpha, self.kappa)
-            actor = ObGD(actor_z_w, actor, td_error, self.alpha, self.kappa)
+            critic = ObGD(critic_z_w, critic, td_error, self.alpha, self.value_kappa)
+            actor = ObGD(actor_z_w, actor, td_error, self.alpha, self.policy_kappa)
 
             next_ts = ts.replace(
                 key=key,
@@ -229,7 +231,7 @@ if __name__ == "__main__":
     key, key_reset, key_act, key_step = jax_random.split(key, 4)
 
     # Instantiate the environment & its settings.
-    env, env_params = make("Pendulum-v1")
+    env, env_params = make("MountainCarContinuous-v0")
     # env_params = env_params.replace(max_steps_in_episode=10_000)
 
     gamma = 0.99
@@ -250,9 +252,10 @@ if __name__ == "__main__":
         gamma=gamma,
         lambda_=0.8,
         alpha=1.0,
-        kappa=2.0,
-        tau=0.1,
-        total_timesteps=100_000,
-        eval_freq=500,
+        policy_kappa=3.0,
+        value_kappa=2.0,
+        tau=0.01,
+        total_timesteps=1_000_000,
+        eval_freq=5000,
         eval_callback=evaluate
     ).train(key_act)
