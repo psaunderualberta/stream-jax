@@ -120,11 +120,10 @@ class Actor(eqx.Module):
     def log_prob(self, x, action):
         mu, std = self(x)
         covar = std**2
-        log_scale = jnp.log(covar.sum(axis=-1))
 
         return (
             -1/2 * ((action - mu).T * (1 / covar) * (action - mu)).sum(axis=-1)
-            - 1/2 * log_scale
+            - 1/2 * jnp.log(covar.sum())
             - 0.5 * self.num_actions * jnp.log(2 * jnp.pi)
         )
 
