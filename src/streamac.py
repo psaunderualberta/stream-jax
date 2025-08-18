@@ -195,7 +195,8 @@ class StreamAC:
         hidden_layer_sizes = [32, 32]  # Example hidden layer sizes
 
         key, key_actor, key_critic = jax_random.split(key, 3)
-        actor = Actor(obs_shape[0], hidden_layer_sizes, key_actor)
+        num_actions = self.env.action_space(self.env_params).shape[0]
+        actor = Actor(obs_shape[0], hidden_layer_sizes, num_actions, key_actor)
         critic = Critic(obs_shape[0], hidden_layer_sizes, key_critic)
 
         reward_stats = SampleMeanStats.new_params(())
@@ -231,7 +232,7 @@ if __name__ == "__main__":
     key, key_reset, key_act, key_step = jax_random.split(key, 4)
 
     # Instantiate the environment & its settings.
-    env, env_params = make("MountainCarContinuous-v0")
+    env, env_params = make("Pendulum-v1")
     # env_params = env_params.replace(max_steps_in_episode=10_000)
 
     gamma = 0.99

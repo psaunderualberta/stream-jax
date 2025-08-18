@@ -53,6 +53,7 @@ class QNetwork(eqx.Module):
 
 class Actor(eqx.Module):
     layers: list[chex.Array]
+    num_actions: float
     mu_layer: chex.Array
     std_layer: chex.Array
     activation: eqx.Module
@@ -61,6 +62,7 @@ class Actor(eqx.Module):
             self,
             obs_shape: int,
             hidden_layer_sizes: list[int],
+            num_actions: int,
             key: chex.PRNGKey,
             activation: eqx.Module = LeakyReLU()
         ):
@@ -85,9 +87,11 @@ class Actor(eqx.Module):
             in_size = size
 
         # Final output layers
+        self.num_actions = num_actions * 1.0  # Ensure num_actions is a float
+        num_actions = int(num_actions)
         key, _mu_key, _std_key = jax_random.split(key, 3)
-        self.mu_layer = Linear(in_size, 1, key=_mu_key)
-        self.std_layer = Linear(in_size, 1, key=_std_key)
+        self.mu_layer = Linear(in_size, num_actions, key=_mu_key)
+        self.std_layer = Linear(in_size, num_actions, key=_std_key)
 
     @jit
     def __call__(self, x):
@@ -96,29 +100,32 @@ class Actor(eqx.Module):
         
         mu = self.mu_layer(x)
         pre_std = self.std_layer(x)
-        std = lax.select(pre_std >= 20, pre_std, softplus(pre_std))
+        std = jnp.where(pre_std >= 20, pre_std, softplus(pre_std))
         return mu, std
     
     @jit
     def sample(self, x, key):
         mu, std = self(x)
-        return jax_random.normal(key, (), dtype=x.dtype) * std + mu
+        return jax_random.normal(key, mu.shape, dtype=x.dtype) * std + mu
 
     @jit
     def entropy(self, x):
         _, std = self(x)
-        return 0.5 + 0.5 * jnp.log(2 * jnp.pi) + jnp.log(std)
-    
+        return (
+            0.5 * self.num_actions * (1 + jnp.log(2 * jnp.pi))
+            + 0.5 * jnp.log((std**2).sum())  # Log of determinant of covariance matrix
+        )
+
     @jit
     def log_prob(self, x, action):
         mu, std = self(x)
-        var = std**2
-        log_scale = jnp.log(std)
+        covar = std**2
+        log_scale = jnp.log(covar.sum(axis=-1))
 
         return (
-            -((action - mu) ** 2) / (2 * var)
-            - log_scale
-            - jnp.log(jnp.sqrt(2 * jnp.pi))
+            -1/2 * ((action - mu).T * (1 / covar) * (action - mu)).sum(axis=-1)
+            - 1/2 * log_scale
+            - 0.5 * self.num_actions * jnp.log(2 * jnp.pi)
         )
 
 
